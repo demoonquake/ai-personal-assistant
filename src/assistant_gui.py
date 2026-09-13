@@ -8,8 +8,8 @@
 启动时同样有『主动汇报』。
 技术：界面用 Python 自带的 tkinter；脑子复用 personal_assistant.py 的 team，
       后台线程跑推理，界面永不卡死。
-运行：python assistant_gui.py
-     python assistant_gui.py --selftest   （无窗口冒烟测试）
+运行：python src/assistant_gui.py
+     python src/assistant_gui.py --selftest   （无窗口冒烟测试）
 """
 
 import sys
@@ -17,6 +17,11 @@ import os
 import queue
 import threading
 import datetime
+
+# src/ 不在默认搜索路径：脚本方式运行（python src/assistant_gui.py）时 Python 会自动带上，
+# 但以模块方式加载（python -m src.assistant_gui / import src.assistant_gui）时找不到
+# personal_assistant，这里统一把本文件所在目录加进搜索路径，两种运行方式都能用。
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 # --selftest：不弹窗口，验证 team 调用链路后退出
 if "--selftest" in sys.argv:
@@ -97,11 +102,15 @@ root.title("🤵 我的私人助理")
 root.geometry("680x560")
 root.configure(bg=BG)
 
-# 应用图标：窗口标题栏 + Windows 任务栏都用 assistant.ico
+# 应用图标：窗口标题栏 + Windows 任务栏都用 packaging/assistant.ico
 # 打包成 exe 后资源在 _MEIPASS 临时解包目录里，所以要做兼容
 def _res(name: str) -> str:
-    base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
-    return os.path.join(base, name)
+    if getattr(sys, "frozen", False):
+        base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(sys.executable)))
+        return os.path.join(base, name)
+    # 开发模式下图标位于整理后的 packaging/ 目录。
+    return os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                        "packaging", name)
 
 _ICO = _res("assistant.ico")
 try:

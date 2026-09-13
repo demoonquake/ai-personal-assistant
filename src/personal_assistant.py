@@ -19,7 +19,7 @@
         长线记忆 = 笔记文件持久化（重启后读回来，每条带记录时间），
         短线对话 = 程序内存里的 history 列表（跨轮携带）。
 ================================================
-运行：python personal_assistant.py
+运行：python src/personal_assistant.py
 """
 
 import os
@@ -48,8 +48,12 @@ from langchain.agents import create_agent
 if getattr(sys, "frozen", False):
     BASE_DIR = os.path.dirname(os.path.abspath(sys.executable))
 else:
-    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+    # 源码位于 src/，运行数据仍统一放在项目根目录 runtime/assistant_memory/。
+    BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 MEMORY_DIR = os.path.join(BASE_DIR, "assistant_memory")
+# 整理后的运行数据目录；保留 frozen 模式下 exe 旁边的数据布局。
+if not getattr(sys, "frozen", False):
+    MEMORY_DIR = os.path.join(BASE_DIR, "runtime", "assistant_memory")
 os.makedirs(MEMORY_DIR, exist_ok=True)
 
 # ---- 多用户支持（v0.2）----
@@ -524,7 +528,7 @@ def remove_todo(keyword: str) -> str:
 def pick_todo_kw(raw: str) -> str:
     """从一句话里抠出要定位的那个待办关键词（把命令口吻词剥掉）。"""
     kw = raw
-    for w in ("待办", "提醒", "别忘了", "完成", "搞定了", "做完了", "做掉了", "删掉", "取消",
+    for w in ("待办", "提醒", "别忘了", "完成", "搞定了", "做完了", "做掉了", "删掉", "删了", "取消", "划掉",
               "移除", "删除", "帮我", "把", "那个", "这个", "一下", "了", "的", "我",
               "看看", "我的", "先"):
         kw = kw.replace(w, "")
@@ -998,7 +1002,7 @@ def _all_memories() -> list:
 
 # ---- 向量检索（真·语义 RAG）：fastembed + 中文 bge-small 模型，ONNX 跑、无需 PyTorch ----
 # 优先级：向量检索（明白"压力大"和"失眠"是相关的）→ bigram 轻量检索（永远可用的回退）。
-# 首次使用自动下载 ~100MB 中文模型到 models/ 目录（之后离线）；下载不了/没装都自动回退，绝不卡启动。
+# 首次使用自动下载 ~100MB 中文模型到 cache/models/ 目录（之后离线）；下载不了/没装都自动回退，绝不卡启动。
 _EMB_MODEL_NAME = "BAAI/bge-small-zh-v1.5"
 _EMB_QUERY_PREFIX = "为这个句子生成表示以用于检索相关文章："   # BGE 中文官方推荐的查询前缀
 _embedder = None            # 共享的 embedder（延迟加载，只初始化一次）
@@ -1011,12 +1015,12 @@ def _ensure_embedder():
     if _embed_state == "untried":
         try:
             from fastembed import TextEmbedding
-            cache = os.path.join(BASE_DIR, "models")
+            cache = os.path.join(BASE_DIR, "cache", "models")
             os.makedirs(cache, exist_ok=True)
             _embedder = TextEmbedding(_EMB_MODEL_NAME, cache_dir=cache)
             _embedder.embed([_EMB_QUERY_PREFIX + "预热"])      # 触发热身/首次下载
             _embed_state = "ok"
-            print("🧠 记忆向量检索已启用（bge-small-zh，模型缓存于 models/ 目录）")
+            print("🧠 记忆向量检索已启用（bge-small-zh，模型缓存于 cache/models/ 目录）")
         except Exception as e:
             _embedder = None
             _embed_state = "failed"
@@ -1532,10 +1536,24 @@ def add_todo_item(item: str) -> str:
         return "；".join(add_todo(p) for p in parts)
     return add_todo(cleaned.strip())
 
-# 聊天模型可自主调用的工具（含两个低危『写』工具：设提醒/加待办；
+@tool
+def done_todo_tool(keyword: str) -> str:
+    """把用户待办清单里的一【件事】标记为已完成。keyword 只写那件事的关键词（例：『买牛奶』→ 传『买牛奶』）。
+    用户说『XX做完了/搞定XX/办完XX/把XX划掉』这类话时用。"""
+    return done_todo(keyword)
+
+@tool
+def remove_todo_tool(keyword: str) -> str:
+    """从用户待办清单删除【一件事】（彻底移除，不是标完成）。keyword 只写那件事的关键词。
+    用户说『删掉XX待办/取消XX/移除XX/不要XX了』这类话时用；删不掉就如实反馈，别自己编。"""
+    return remove_todo(keyword)
+
+# 聊天模型可自主调用的工具（含四个低危『写』工具：设提醒/加待办/完成待办/删待办；
+# 只改 todo.md、reminders.md 这类数据表，不碰记忆笔记；
 # 记忆文件的增删改仍走确定性 executor，不交给模型）
 CHAT_TOOLS = [calculate, get_weather, get_current_time, list_todos_tool, search_web, morning_report,
-              set_reminder, add_todo_item, add_schedule, list_schedule_tool]
+              set_reminder, add_todo_item, done_todo_tool, remove_todo_tool,
+              add_schedule, list_schedule_tool]
 CHAT_TOOL_REGISTRY = {t.name: t for t in CHAT_TOOLS}
 
 def run_side_effects(user_raw: str) -> str:
@@ -1567,9 +1585,10 @@ def _chat_system_prompt(long_mem: str, system_extra: str = "", name_hint: str = 
     return (
         f"你是私人助理团队里的『聊天』担当，说话风格：{style}。\n"
         "你有几个工具可用：查天气(get_weather，可查今天/明天/后天)、算数(calculate)、查当前时间(get_current_time)、"
-        "看待办清单(list_todos_tool)、联网搜索(search_web)、每日晨报(morning_report)、"
-        "设提醒(set_reminder)、加待办(add_todo_item)、"
-        "记日程(add_schedule)、查日程(list_schedule_tool)。"
+        "待办清单在查看后支持增删改：看待办(list_todos_tool)、加待办(add_todo_item)、"
+        "完成待办(done_todo_tool，用户说『XX做完了』时用)、删待办(remove_todo_tool，用户说『删掉XX/取消XX』时用)、"
+        "联网搜索(search_web)、每日晨报(morning_report)、"
+        "设提醒(set_reminder)、记日程(add_schedule)、查日程(list_schedule_tool)。"
         "遇到实时新闻/概念/百科类问题用 search_web 搜一下再回答；用户要你设置提醒/加待办/记日程时用对应工具真实执行。\n"
         "用户说『每日晨报』『今日晨报』『看晨报』『汇报今天的安排』时就调 morning_report 生成；"
         "多工具任务示例：用户说『明天下雨就提醒我带伞』→ 第一步调 get_weather 查明天降水概率 → "
@@ -1667,6 +1686,7 @@ _TOOL_STATUS_NAMES = {
     "calculate": "算数", "get_weather": "查天气", "get_current_time": "看时间",
     "list_todos_tool": "看待办", "search_web": "联网搜索", "morning_report": "生成晨报",
     "set_reminder": "设提醒", "add_todo_item": "加待办",
+    "done_todo_tool": "标完成", "remove_todo_tool": "删待办",
     "add_schedule": "记日程", "list_schedule_tool": "查日程",
 }
 
@@ -1912,6 +1932,10 @@ def _get_reflect_agent():
 
 def reflect_memory(user_raw: str, history: list) -> str:
     """记忆反思：拿『最新对话』对账『相关旧记忆』，发现过时/冲突就自动更新或删除。"""
+    # 数据表操作命令（待办/提醒/日程/晨报）只改 todo.md、reminders.md 等，
+    # 与用户记忆无关；若不拦住，『删掉XX待办』会被反思误当『删除→XX』指令，威胁真实记忆
+    if any(w in user_raw for w in ("待办", "提醒", "别忘了", "日程", "晨报")):
+        return ""
     ctx_parts = [user_raw]
     for m in list(history or [])[-4:]:
         if getattr(m, "type", "") == "human" and getattr(m, "content", None):

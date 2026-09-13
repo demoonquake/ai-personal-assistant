@@ -4,10 +4,10 @@ __pycache__/
 *.pyo
 
 # 用户数据（记忆、待办、提醒、日程、以及助理名字等个人信息）
-assistant_memory/
+runtime/assistant_memory/
 
 # 浏览器版多用户数据（用户目录、users.json 全是隐私）
-data/
+runtime/data/
 
 # 密钥（绝不能上传）
 deepseek_key.txt
@@ -15,11 +15,11 @@ deepseek_key.txt
 .env
 
 # 向量模型缓存（~100MB，首次使用自动下载到本地）
-models/
+cache/models/
 
 # 打包产物
-build/
-dist/
+build_artifacts/build/
+build_artifacts/dist/
 *.spec
 *.exe
 *.ico

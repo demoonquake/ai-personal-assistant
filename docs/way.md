@@ -14,7 +14,7 @@
 python -m pip install -r requirements.txt
 
 # 第 2 步：启动
-python server.py
+python src/server.py
 ```
 
 第一次运行会提示你粘贴 DeepSeek Key，粘进去回车（会自动保存，以后不用再填）。
@@ -28,10 +28,10 @@ http://127.0.0.1:8000
 
 ## 停止
 
-回到跑 `python server.py` 的终端，按 `Ctrl + C`。
+回到跑 `python src/server.py` 的终端，按 `Ctrl + C`。
 
 ## 说明
 
-- 全部数据存在本文件夹的 assistant_memory/（不会上传任何地方）
+- 全部数据存在本文件夹的 runtime/assistant_memory/（不会上传任何地方）
 - 仅本机可访问，安全
-- 依赖清单见 requirements.txt
+- 依赖清单见根目录 requirements.txt

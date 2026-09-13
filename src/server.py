@@ -4,17 +4,23 @@
 在 v0.1 基础上新增多用户：
   · POST /api/auth              注册/登录（用户名 + 可选密码），返回 token
   · 其余接口带上 Authorization: Bearer <token>，
-    每个用户有自己独立的记忆/待办/提醒/日程（存 data/users/<name>/assistant_memory/）
+  · 每个用户有自己独立的记忆/待办/提醒/日程（存 runtime/data/users/<name>/assistant_memory/）
   · 密码用 SHA-256 加盐哈希存 users.json；密码可留空（适合单人自用）
-运行：python server.py → 浏览器打开 http://127.0.0.1:8000
+运行：python src/server.py → 浏览器打开 http://127.0.0.1:8000
 """
 
 import os
+import sys
 import json
 import hashlib
 import secrets
 import datetime
 import threading
+
+# src/ 不在默认搜索路径：脚本方式运行（python src/server.py）时 Python 会自动带上，
+# 但以模块方式加载（python -m src.server / import src.server）时找不到 personal_assistant，
+# 这里统一把本文件所在目录加进搜索路径，两种运行方式都能用。
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
@@ -23,8 +29,8 @@ from pydantic import BaseModel
 
 from langchain_core.messages import AIMessage, HumanMessage
 
-BASE = os.path.dirname(os.path.abspath(__file__))
-DATA_DIR = os.path.join(BASE, "data")
+BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+DATA_DIR = os.path.join(BASE, "runtime", "data")
 USERS_FILE = os.path.join(DATA_DIR, "users.json")
 MAX_HISTORY = 12
 
@@ -241,12 +247,13 @@ def reminders_due(request: Request):
     return {"due": out}
 
 
-app.mount("/static", StaticFiles(directory=os.path.join(BASE, "static")), name="static")
+STATIC_DIR = os.path.join(BASE, "web", "static")
+app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 
 @app.get("/")
 def index():
-    return FileResponse(os.path.join(BASE, "static", "index.html"))
+    return FileResponse(os.path.join(STATIC_DIR, "index.html"))
 
 
 if __name__ == "__main__":

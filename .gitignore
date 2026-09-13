@@ -14,6 +14,9 @@ deepseek_key.txt
 *.env
 .env
 
+# 向量模型缓存（~100MB，首次使用自动下载到本地）
+models/
+
 # 打包产物
 build/
 dist/

@@ -914,17 +914,145 @@ def morning_report_due() -> str:
 
 
 # ---------------------------------------------------------------
-# 2) 启动时：把已存的笔记加载成"长期记忆"塞进人设（重启不忘的关键）
+# 2.1) 记忆检索（轻量 RAG，零新依赖）
+#     以前是"所有记忆都塞进人设"：记忆一多就费 token、重点被淹没。
+#     现在改成"按用户问什么挑最相关的几条"——
+#     中文用双字组(bigram)相似度打分（不用装分词库），标题被点名大大加分，
+#     最后保证『名字/默认城市』这类核心记忆永远在场。
 # ---------------------------------------------------------------
-def load_long_memory() -> str:
-    lines = []
+MEMORY_ALWAYS_KEEP = ("名字", "默认城市")     # 核心记忆：无论检索命中与否都带上
+
+# 主题词加权：问题带这些词、标题也带 → 明显更相关（弥补双字组对短词/单字的不敏感）
+_TOPIC_HINTS = ("课程", "课", "考试", "作业", "生日", "纪念日", "爱好", "喜欢", "讨厌",
+                "名字", "姓名", "学校", "年级", "城市", "睡眠", "耳机", "比赛", "火锅",
+                "聚会", "串串", "实习", "工作", "考研", "复习", "室友", "请假", "行程")
+
+def _clean(text: str) -> str:
+    return re.sub(r"[\s，。、！？!?,.;:：\-—()（）「」『』\"'“”《》]", "", str(text))
+
+def _bigrams(text: str) -> set:
+    """中文双字组集合：'睡觉' → {'睡觉'}，无需分词库就能算相似度。"""
+    s = _clean(text)
+    return {s[i:i + 2] for i in range(len(s) - 1)} if len(s) >= 2 else {s}
+
+def _memory_score(query: str, title: str, content: str) -> float:
+    """给一条记忆打相关分：单字重叠(1×) + 双字组重叠(3×，语义强)；标题被点名/主题词命中大加分。"""
+    q1, d1 = set(_clean(query)), set(_clean(f"{title}{content}"))
+    score = 1.0 * len(q1 & d1) + 3.0 * len(_bigrams(query) & _bigrams(f"{title}{content}"))
+    if title and title in query:
+        score += 8.0        # 用户直接提到标题词（如『我的爱好』）
+    for kw in _TOPIC_HINTS:
+        if kw in query and kw in title:
+            score += 5.0    # 问『考试』且这条叫『考试』/『课程』→ 强相关
+    return score
+
+def _all_memories() -> list:
+    """读出全部记忆（标题/纯净内容/记录时间）。"""
+    items = []
     for fn in sorted(os.listdir(user_dir())):
         if fn.endswith(".md") and fn not in NON_MEMORY_FNS:
-            title = fn[:-3]
             with open(os.path.join(user_dir(), fn), encoding="utf-8") as f:
-                content, _ = unpack_note(f.read())
-            lines.append(f"- {title}: {content}")
+                content, ts = unpack_note(f.read())
+            items.append({"title": fn[:-3], "content": content, "time": ts})
+    return items
+
+# ---- 向量检索（真·语义 RAG）：fastembed + 中文 bge-small 模型，ONNX 跑、无需 PyTorch ----
+# 优先级：向量检索（明白"压力大"和"失眠"是相关的）→ bigram 轻量检索（永远可用的回退）。
+# 首次使用自动下载 ~100MB 中文模型到 models/ 目录（之后离线）；下载不了/没装都自动回退，绝不卡启动。
+_EMB_MODEL_NAME = "BAAI/bge-small-zh-v1.5"
+_EMB_QUERY_PREFIX = "为这个句子生成表示以用于检索相关文章："   # BGE 中文官方推荐的查询前缀
+_embedder = None            # 共享的 embedder（延迟加载，只初始化一次）
+_embed_state = "untried"    # "untried" / "ok" / "failed"
+_mem_index = (None, None)   # 记忆向量缓存：(签名, np.ndarray)（记忆没变就不重算）
+
+def _ensure_embedder():
+    """延迟加载向量模型（首次用到才下载/加载）；失败则标记 failed，之后永远走回退。"""
+    global _embedder, _embed_state
+    if _embed_state == "untried":
+        try:
+            from fastembed import TextEmbedding
+            cache = os.path.join(BASE_DIR, "models")
+            os.makedirs(cache, exist_ok=True)
+            _embedder = TextEmbedding(_EMB_MODEL_NAME, cache_dir=cache)
+            _embedder.embed([_EMB_QUERY_PREFIX + "预热"])      # 触发热身/首次下载
+            _embed_state = "ok"
+            print("🧠 记忆向量检索已启用（bge-small-zh，模型缓存于 models/ 目录）")
+        except Exception as e:
+            _embedder = None
+            _embed_state = "failed"
+            print(f"⚠ 向量检索不可用，回退轻量关键词检索：{e}")
+    return _embedder
+
+def _memory_vectors(items: list):
+    """批算出每条记忆的向量并缓存（内容没变就不重算）。不可用返回 None。"""
+    global _mem_index
+    sig = tuple((it["title"], it["content"]) for it in items)
+    if _mem_index[0] == sig:
+        return _mem_index[1]
+    e = _ensure_embedder()
+    if e is None:
+        return None
+    try:
+        import numpy as np
+        docs = [f"{it['title']}：{it['content']}" for it in items]   # 文档端不加检索前缀
+        vecs = np.array(list(e.embed(docs)))
+        _mem_index = (sig, vecs)
+        return vecs
+    except Exception:
+        return None
+
+def _lexical_pick(items: list, query: str, top_k: int) -> list:
+    """轻量关键词兜底：单字 + 双字组 + 标题/主题词加权打分。"""
+    scored = sorted(items, key=lambda it: _memory_score(query, it["title"], it["content"]),
+                    reverse=True)
+    return scored[:top_k]
+
+def _vector_pick(items: list, query: str, top_k: int):
+    """向量语义检索：query 编码后与记忆库做余弦相似度，取 top_k。不可用返回 None。"""
+    e = _ensure_embedder()
+    vecs = _memory_vectors(items)
+    if e is None or vecs is None:
+        return None
+    try:
+        import numpy as np
+        qv = np.array(list(e.embed([_EMB_QUERY_PREFIX + query])))[0]
+        denom = np.linalg.norm(vecs, axis=1) * np.linalg.norm(qv) + 1e-9
+        scores = (vecs @ qv) / denom
+        return [items[i] for i in np.argsort(-scores)[:top_k]]
+    except Exception:
+        return None
+
+def retrieve_memory(query: str, top_k: int = 5) -> str:
+    """按问题检索最相关的 top_k 条记忆（向量优先，bigram 兜底）；
+    核心记忆（名字/默认城市）检索丢了也会兜底带上。"""
+    items = _all_memories()
+    if not items:
+        return "（暂无记忆）"
+    picked = _vector_pick(items, query, top_k)
+    if picked is None:
+        picked = _lexical_pick(items, query, top_k)
+    titles = {it["title"] for it in picked}
+    for it in items:                                     # 核心记忆兜底
+        if len(picked) >= top_k + 2:
+            break
+        if it["title"] in MEMORY_ALWAYS_KEEP and it["title"] not in titles:
+            picked.append(it)
+            titles.add(it["title"])
+    lines = []
+    for it in picked:
+        line = f"- {it['title']}: {it['content']}"
+        if it["time"]:
+            line += f"（记于 {it['time']}）"
+        lines.append(line)
     return "\n".join(lines) if lines else "（暂无记忆）"
+
+def _chat_memory(user_raw: str, history: list) -> str:
+    """聊天时要带的记忆：用『本轮问题 + 最近几轮』当检索词，只带相关的几条。"""
+    parts = [user_raw]
+    for m in list(history or [])[-6:]:
+        if getattr(m, "type", "") == "human" and getattr(m, "content", None):
+            parts.append(m.content)
+    return retrieve_memory(" ".join(p for p in parts if p))
 
 
 # ---------------------------------------------------------------
@@ -1403,7 +1531,7 @@ def _chat_system_prompt(long_mem: str, system_extra: str = "", name_hint: str = 
 
 def _build_chat_msgs(user_raw: str, history: list, extra: str = "") -> list:
     """构建『聊天』的输入消息（与 chat_node 一致；extra 是兜底写操作/总结的提示）。"""
-    long_mem = load_long_memory()
+    long_mem = _chat_memory(user_raw, history)   # RAG：只带与当前话题相关的记忆
     system_extra = ""
     if fire_log():                        # 后台已经响过的提醒，要让聊天席知道，别再说"还在等"
         system_extra = f"\n系统近况（已发生的事，别把它当未来计划）：{'；'.join(fire_log())}"
@@ -1425,7 +1553,7 @@ def chat_node(state: AsstState) -> dict:
         if m.type == "human" and m.content:
             user_raw = m.content
             break
-    long_mem = load_long_memory()
+    long_mem = _chat_memory(user_raw, state.get("history", []))   # RAG：只带相关记忆
     system_extra = ""
     if fire_log():                        # 后台已经响过的提醒，要让聊天席知道，别再说"还在等"
         system_extra = f"\n系统近况（已发生的事，别把它当未来计划）：{'；'.join(fire_log())}"

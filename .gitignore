@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# 用户数据（记忆、待办、提醒、日程、以及助理名字等个人信息）
+assistant_memory/
+
+# 密钥（绝不能上传）
+deepseek_key.txt
+*.env
+.env
+
+# 打包产物
+build/
+dist/
+*.spec
+*.exe
+*.ico
+*.zip
+
+# IDE / 系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

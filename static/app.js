@@ -111,7 +111,10 @@ async function pollReminders() {
   if (!TOKEN) return;
   try {
     const d = await api('/api/reminders/due');
-    for (const it of d.due || []) addMsg('sys', '⏰ 提醒时间到：' + it.text + '（' + it.time + '）');
+    for (const it of d.due || []) {
+      if (it.report) addMsg('assistant', '📰 每日晨报\n' + it.report);
+      else addMsg('sys', '⏰ 提醒时间到：' + it.text + '（' + it.time + '）');
+    }
   } catch (e) { /* 静默 */ }
 }
 

@@ -209,6 +209,9 @@ def check_reminders() -> None:
             pa.FIRE_LOG.append(f"已在 {it['at'].strftime('%H:%M')} 提醒过用户：{it['text']}")
             del pa.FIRE_LOG[:-5]
         put("sys", f"⏰ 提醒时间到：{it['text']}（{it['at'].strftime('%H:%M')}）")
+    rep = pa.morning_report_due()      # 每日晨报：到点自动推一次进聊天区
+    if rep:
+        put("ai", f"📰 每日晨报\n{rep}")
     root.after(2000, check_reminders)
 
 

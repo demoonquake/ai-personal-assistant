@@ -574,6 +574,10 @@ def _reminder_watcher() -> None:
                 fire_log().append(f"已在 {it['at'].strftime('%H:%M')} 提醒过用户：{it['text']}")
                 del fire_log()[:-5]      # 只留最近 5 条
             print(f"\n⏰ 提醒时间到：{it['text']}（{it['at'].strftime('%H:%M')}）")
+        rep = morning_report_due()       # 每日晨报：到点自动推一次
+        if rep:
+            print(f"\n📰 每日晨报（{datetime.datetime.now().strftime('%H:%M')}）")
+            print(rep)
         time.sleep(2)
 
 
@@ -719,6 +723,117 @@ def make_startup_briefing() -> str:
     except Exception:
         pass
     return "\n".join(fallback)
+
+
+def make_morning_report() -> str:
+    """每日晨报：确定性汇总（今日日程 / 今明两天天气 / 未完成待办 / 今日提醒）
+    → DeepSeek 组织成一段自然晨报；模型异常时回退到确定性模板。"""
+    now = datetime.datetime.now()
+    week = ("星期一", "星期二", "星期三", "星期四", "星期五", "星期六", "星期日")[now.weekday()]
+    name = "朋友"
+    name_path = os.path.join(user_dir(), "名字.md")
+    if os.path.exists(name_path):
+        n, _ = unpack_note(open(name_path, encoding="utf-8").read())
+        if n:
+            name = n
+    date_cn = now.strftime("%Y年%m月%d日")
+
+    # ---- 确定性收集『今天的料』：全部来自真实数据，模型不许编 ----
+    def safe(fn, *a):
+        try:
+            return fn(*a)
+        except Exception:
+            return ""
+    tod_sch = safe(list_schedule, "今天")
+    tom_sch = safe(list_schedule, "明天")
+    w_today = safe(get_weather.func, "", "今天")
+    w_tomorrow = safe(get_weather.func, "", "明天")
+    todos = [t for t in load_todos() if not t["done"]]
+    today_rems = [it for it in load_reminders() if it["at"].date() == now.date()]
+    rec_line = ("、".join(f"{it['text']}（{it['at'].strftime('%H:%M')}）" for it in today_rems)
+                if today_rems else "今日无提醒")
+
+    data_lines = [
+        f"日期：{date_cn} {week}",
+        f"用户称呼：{name}",
+        f"今日日程：{tod_sch}",
+        f"明日日程：{tom_sch if tom_sch and '没有相关安排' not in tom_sch else '明日暂无安排'}",
+        f"今日天气：{w_today}",
+        f"明日天气：{w_tomorrow}",
+        f"未完成待办：{len(todos)} 件" + (f" —— {'、'.join(t['item'] for t in todos)}" if todos else "，暂无"),
+        f"今日提醒：{rec_line}",
+    ]
+
+    # 回退模板（模型失败时用，保证晨报永不卡壳）
+    fallback = [f"{date_cn} {week}，早安，{name}！"]
+    fallback.append(f"今天天气：{w_today}。明日：{w_tomorrow}" if w_today and not w_today.startswith("（")
+                    else "今天天气暂时没查到。")
+    if "没有相关安排" not in tod_sch:
+        fallback.append(f"今天日程：{tod_sch}")
+    fallback.append(f"还有 {len(todos)} 件待办没做完：{'、'.join(t['item'] for t in todos)}。"
+                    if todos else "待办清单是空的，一身轻松～")
+    if today_rems:
+        fallback.append("今天设了提醒：" + "、".join(
+            f"{it['text']}（{it['at'].strftime('%H:%M')}）" for it in today_rems))
+    else:
+        fallback.append("今天没有设提醒。")
+
+    try:
+        ai = chat_model.invoke([
+            SystemMessage(content=(
+                "你是私人助理，正在为用户出一份『每日晨报』。数据已由程序确定性收集（真实数据，绝对不许编造）。\n"
+                f"要求输出一段自然、有条理、亲切的晨报，按这个顺序组织：\n"
+                f"1) 问候（带用户称呼和日期星期）；\n"
+                f"2) 今天天气怎么样 + 明天简单预告，温度落差大或有雨就顺带一句提醒建议；\n"
+                f"3) 今天的日程安排；\n"
+                f"4) 还没做完的待办，先点要紧的；\n"
+                f"5) 今天的提醒；\n"
+                f"6) 结尾一句简短鼓励。\n"
+                "只使用数据里的事实，查不到或没有就说没有。输出纯文本，不要标题和列表符号。"
+            )),
+            HumanMessage(content="\n".join(data_lines)),
+        ])
+        text = (ai.content or "").strip()
+        if text:
+            return text
+    except Exception:
+        pass
+    return "\n".join(fallback)
+
+@tool
+def morning_report() -> str:
+    """生成『每日晨报』：汇总今天的日程、今明两天天气、未完成待办和今日提醒，
+    让用户一眼看清今天要做什么。用户说『每日晨报』『今日晨报』『看晨报』『汇报今天安排』时调用。"""
+    return make_morning_report()
+
+
+# 自动推送晨报：每天到点后首次轮询时推送一次（终端/GUI/网页三入口共用）。
+# 判断靠用户目录下的 morning_done.txt 记『今天已推过的日期』→ 全天只推一次、多端同时开也不重复。
+MORNING_REPORT_TIME = "08:00"   # 每天早上自动推送晨报的时刻（24小时制，改完重启生效）
+
+def morning_report_due() -> str:
+    """到点且今天还没推过晨报 → 生成晨报并落盘标记；未到点/已推过返回空串。"""
+    now = datetime.datetime.now()
+    h, m = map(int, MORNING_REPORT_TIME.split(":"))
+    if (now.hour, now.minute) < (h, m):
+        return ""
+    flag = os.path.join(user_dir(), "morning_done.txt")
+    done = ""
+    try:
+        if os.path.exists(flag):
+            with open(flag, encoding="utf-8") as f:
+                done = f.read().strip()
+    except Exception:
+        done = ""  # 读不到就当没推过，照常生成
+    if done == now.strftime("%Y-%m-%d"):
+        return ""
+    report = make_morning_report()
+    try:
+        with open(flag, "w", encoding="utf-8") as f:
+            f.write(now.strftime("%Y-%m-%d"))
+    except Exception:
+        pass  # 写失败只丢去重标记，晨报仍正常返回
+    return report
 
 
 # ---------------------------------------------------------------
@@ -1159,7 +1274,7 @@ def add_todo_item(item: str) -> str:
 
 # 聊天模型可自主调用的工具（含两个低危『写』工具：设提醒/加待办；
 # 记忆文件的增删改仍走确定性 executor，不交给模型）
-CHAT_TOOLS = [calculate, get_weather, get_current_time, list_todos_tool, search_web,
+CHAT_TOOLS = [calculate, get_weather, get_current_time, list_todos_tool, search_web, morning_report,
               set_reminder, add_todo_item, add_schedule, list_schedule_tool]
 CHAT_TOOL_REGISTRY = {t.name: t for t in CHAT_TOOLS}
 
@@ -1197,9 +1312,11 @@ def chat_node(state: AsstState) -> dict:
             content=(
                 "你是私人助理团队里的『聊天』担当，语气温柔，回答简短自然。\n"
                 "你有几个工具可用：查天气(get_weather，可查今天/明天/后天)、算数(calculate)、查当前时间(get_current_time)、"
-                "看待办清单(list_todos_tool)、联网搜索(search_web)、设提醒(set_reminder)、加待办(add_todo_item)、"
+                "看待办清单(list_todos_tool)、联网搜索(search_web)、每日晨报(morning_report)、"
+                "设提醒(set_reminder)、加待办(add_todo_item)、"
                 "记日程(add_schedule)、查日程(list_schedule_tool)。"
                 "遇到实时新闻/概念/百科类问题用 search_web 搜一下再回答；用户要你设置提醒/加待办/记日程时用对应工具真实执行。\n"
+                "用户说『每日晨报』『今日晨报』『看晨报』『汇报今天的安排』时就调 morning_report 生成；"
                 "多工具任务示例：用户说『明天下雨就提醒我带伞』→ 第一步调 get_weather 查明天降水概率 → "
                 "第二步根据结果决定：会下雨才调 set_reminder（text 只写『带伞』，when 用用户给的时间，没给就用明天8点这种合理时间）；"
                 "不下雨就直接告诉用户明天不用带伞。用户一次说多件事的待办，要拆开、对每件事分别调一次 add_todo_item。\n"

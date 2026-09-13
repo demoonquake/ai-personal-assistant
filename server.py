@@ -212,6 +212,11 @@ def reminders_due(request: Request):
             pa.fire_log().append(f"已在 {it['at'].strftime('%H:%M')} 提醒过用户：{it['text']}")
             del pa.fire_log()[:-5]
         out.append({"text": it["text"], "time": it["at"].strftime("%H:%M")})
+    rep = pa.morning_report_due()        # 每日晨报：到点自动推一次
+    if rep:
+        out.append({"text": "每日晨报",
+                    "time": datetime.datetime.now().strftime("%H:%M"),
+                    "report": rep})
     return {"due": out}
 
 

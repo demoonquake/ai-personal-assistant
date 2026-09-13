@@ -152,15 +152,22 @@ def send() -> None:
     put("user", f"你：{text}")
 
 
-    def run():  # 包一层保证异常不炸线程
+    def run():  # 包一层保证异常不炸线程；流式逐字发送
         try:
-            result = pa.team.invoke({
-                "messages": [HumanMessage(content=text)],
-                "history": list(_history),
-                "memorized": "",
-                "tidied": "",
-            })
-            _q.put(("reply", text, result))
+            full: list = []
+            started = False
+            for kind, payload in pa.stream_reply(text, list(_history)):
+                if kind == "token":
+                    if not started:
+                        _q.put(("astart", text, ""))
+                        started = True
+                    full.append(payload)
+                    _q.put(("tok", text, payload))
+                elif kind == "status":
+                    _q.put(("status", text, payload))
+                elif kind == "memorized":
+                    _q.put(("mem", text, payload))
+            _q.put(("aend", text, "".join(full)))
         except Exception as e:
             _q.put(("error", text, str(e)))
     threading.Thread(target=run, daemon=True).start()
@@ -170,26 +177,27 @@ def send() -> None:
 
 
 def poll() -> None:
-    """主线程定时取后台回复并渲染（Tkinter 只在主线程改 UI）。"""
+    """主线程定时取后台流式事件并渲染（Tkinter 只在主线程改 UI）。"""
     try:
         kind, text, payload = _q.get_nowait()
         if kind == "error":
             put("sys", f"⚠ 出错了：{payload}")
-        else:
-            result = payload
-            final = ""
-            for m in reversed(result["messages"]):
-                if m.type == "ai" and not m.tool_calls and m.content:
-                    final = m.content
-                    break
-            if final:
-                _history.extend([HumanMessage(content=text), AIMessage(content=final)])
+        elif kind == "astart":
+            put("ai", "助理：")
+            chat.mark_set("ai_end", "end-1c lineend")   # 气泡插入点（打字机追加用）
+        elif kind == "tok":
+            chat.configure(state="normal")
+            chat.insert("ai_end", payload, "ai")        # 在同一行气泡末尾逐字追加
+            chat.configure(state="disabled")
+            chat.see(tk.END)
+        elif kind == "status":
+            put("sys", f"🛠 {payload}")
+        elif kind == "mem":
+            put("sys", f"🧠 已摘记：{payload}")
+        elif kind == "aend":
+            if payload:
+                _history.extend([HumanMessage(content=text), AIMessage(content=payload)])
                 del _history[:-MAX_HISTORY]
-                put("ai", f"助理：{final}")
-            if result.get("memorized"):
-                put("sys", "🧠 已摘记：" + result["memorized"])
-            if result.get("tidied"):
-                put("sys", "🧹 已整理：" + result["tidied"])
     except queue.Empty:
         pass
     root.after(150, poll)

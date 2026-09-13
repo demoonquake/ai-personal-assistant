@@ -12,6 +12,7 @@ function addMsg(cls, text) {
   div.textContent = text;
   chat.appendChild(div);
   chat.scrollTop = chat.scrollHeight;
+  return div;
 }
 
 function authHeaders() {
@@ -74,20 +75,51 @@ async function send() {
   if (!text) return;
   msg.value = '';
   addMsg('user', '你：' + text);
+  const bubble = addMsg('assistant', '助理：');
+  let full = '';
   try {
-    const data = await api('/api/chat', {
+    const r = await fetch('/api/chat/stream', {
       method: 'POST',
+      headers: authHeaders(),
       body: JSON.stringify({ message: text, history: HISTORY }),
     });
-    if (data.raw_memory) addMsg('sys', '📒 原始记忆：' + data.raw_memory.replace(/\n/g, '；'));
-    if (data.reply) {
-      addMsg('assistant', (data.from || '助理') + '：' + data.reply);
+    if (r.status === 401) { logout(true); return; }
+    if (!r.ok) {
+      const err = await r.json().catch(() => ({}));
+      throw new Error(err.detail || r.statusText);
+    }
+    // SSE 流式解析：data: {"kind":"...","text":"..."}
+    const reader = r.body.getReader();
+    const decoder = new TextDecoder();
+    let buf = '';
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+      let idx;
+      while ((idx = buf.indexOf('\n\n')) >= 0) {
+        const raw = buf.slice(0, idx); buf = buf.slice(idx + 2);
+        for (const line of raw.split('\n')) {
+          if (!line.startsWith('data: ')) continue;
+          let evt;
+          try { evt = JSON.parse(line.slice(6)); } catch (e2) { continue; }
+          if (evt.kind === 'token') {
+            full += evt.text;
+            bubble.textContent += evt.text;
+            chat.scrollTop = chat.scrollHeight;
+          } else if (evt.kind === 'status') {
+            addMsg('sys', '🛠 ' + evt.text);
+          } else if (evt.kind === 'memorized') {
+            addMsg('sys', '🧠 已摘记：' + evt.text);
+          }
+        }
+      }
+    }
+    if (full) {
       HISTORY.push({ role: 'user', content: text });
-      HISTORY.push({ role: 'assistant', content: data.reply });
+      HISTORY.push({ role: 'assistant', content: full });
       if (HISTORY.length > 12) HISTORY.splice(0, HISTORY.length - 12);
     }
-    if (data.memorized) addMsg('sys', '🧠 已摘记：' + data.memorized);
-    if (data.tidied) addMsg('sys', '🧹 已整理：' + data.tidied);
   } catch (e) {
     if (!String(e).includes('请先登录')) addMsg('sys', '⚠ ' + e);
   }

@@ -17,7 +17,7 @@ import datetime
 import threading
 
 from fastapi import FastAPI, Header, HTTPException, Request
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -183,6 +183,27 @@ def chat(body: ChatIn, request: Request):
         "raw_memory": raw,
         "username": name,
     }
+
+
+@app.post("/api/chat/stream")
+def chat_stream(body: ChatIn, request: Request):
+    """流式聊天（SSE）：回答逐字推送，前端打字机效果。"""
+    name = _current_user(request)
+    text = body.message.strip()
+    if not text:
+        return JSONResponse({"detail": "（空的，说点什么吧）"}, status_code=400)
+
+    def gen():
+        full = ""
+        for kind, payload in pa.stream_reply(text, msgs):
+            if kind == "token":
+                full += payload
+            yield "data: " + json.dumps({"kind": kind, "text": payload}, ensure_ascii=False) + "\n\n"
+        with _users_lock:
+            _histories[name] = (msgs + [HumanMessage(content=text), AIMessage(content=full)])[-MAX_HISTORY:]
+
+    msgs = _to_messages(body.history) or list(_histories.get(name, []))
+    return StreamingResponse(gen(), media_type="text/event-stream")
 
 
 @app.get("/api/startup")

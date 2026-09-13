@@ -77,6 +77,64 @@ NON_MEMORY_FNS = {"todo.md", "reminders.md", "schedule.md", "助理名字.md"}
 
 
 # ---------------------------------------------------------------
+# 0) 熔断器（Circuit Breaker）：给外部依赖装上"保险丝"
+#    某个服务（DeepSeek/天气/搜索）连续失败 → 自动熔断，暂时不再傻等反复调用，
+#    冷却一段时间后自动恢复；期间直接走降级（模板回复/友好提示）。
+#    就像电闸：线路短路跳闸后，先别反复推闸，等一会儿再试。
+# ---------------------------------------------------------------
+class CircuitBreaker:
+    def __init__(self, name: str, fail_threshold: int = 3, cooldown: int = 300):
+        self.name = name
+        self.fail_threshold = fail_threshold   # 连续失败几次触发熔断
+        self.cooldown = cooldown               # 熔断后冷却多少秒再试
+        self._fail_count = 0
+        self._open_until = 0.0
+        self._lock = threading.Lock()
+
+    def allow(self) -> bool:
+        """本次调用是否放行。熔断中且未冷却结束 → 不放行。"""
+        with self._lock:
+            if self._open_until and time.time() < self._open_until:
+                return False
+            return True
+
+    def record_failure(self) -> None:
+        """记一次失败；连续失败达到阈值就触发熔断。"""
+        with self._lock:
+            self._fail_count += 1
+            if self._fail_count >= self.fail_threshold:
+                self._open_until = time.time() + self.cooldown
+                self._fail_count = 0
+                print(f"⚡ [熔断] {self.name} 连续失败 {self.fail_threshold} 次，"
+                      f"暂停调用 {self.cooldown} 秒")
+
+    def record_success(self) -> None:
+        """记一次成功：清零失败计数，若在熔断中也放行（服务恢复了）。"""
+        with self._lock:
+            self._fail_count = 0
+            self._open_until = 0.0
+
+
+CB_MODEL = CircuitBreaker("模型(DeepSeek)")      # 聊天/汇报/晨报/摘记共用的主脑
+CB_WEATHER = CircuitBreaker("天气(Open-Meteo)")
+CB_SEARCH = CircuitBreaker("搜索(必应/DDG)")
+
+
+def _invoke_model(fn) -> object:
+    """统一的『调用模型并记账』入口：熔断中直接抛异常走降级；
+    成功清零失败计数，失败累积（触发熔断）。"""
+    if not CB_MODEL.allow():
+        raise RuntimeError("模型熔断中，跳过本次调用")
+    try:
+        r = fn()
+    except Exception:
+        CB_MODEL.record_failure()
+        raise
+    CB_MODEL.record_success()
+    return r
+
+
+# ---------------------------------------------------------------
 # 1) 私人助理的"本事"：记忆工具（每条笔记自动带"记录时间"）
 # ---------------------------------------------------------------
 TIME_TAG = "<!-- 记录时间："
@@ -174,6 +232,20 @@ def get_weather(city: str = "", day: str = "今天") -> str:
     city 是城市名，用户没指定时传空字符串（自动查用户的默认城市，没有默认城市就用武汉）。
     day 取值『今天』『明天』『后天』，用户没明确说哪天时传『今天』。
     今天能查到当前实况（天气/气温/体感/湿度/风速），明天后天能查到预报（天气/最高最低温/降水概率）。"""
+    # 熔断保护：天气服务连续失败时不再傻等 8 秒超时，直接降级提示
+    if not CB_WEATHER.allow():
+        return "（天气服务暂时不可用，过几分钟再找我查吧）"
+    try:
+        r = _get_weather_core(city, day)
+        CB_WEATHER.record_success()      # 能正常返回（哪怕"没找到城市"）都说明服务是通的
+        return r
+    except Exception as e:
+        CB_WEATHER.record_failure()
+        return f"（天气暂时查不到：{e}）"
+
+
+def _get_weather_core(city: str, day: str) -> str:
+    """真正去 Open-Meteo 查天气（异常冒泡给外层 get_weather 统一熔断记账）。"""
     try:
         if not city:
             city = get_default_city() or "武汉"
@@ -219,8 +291,8 @@ def get_weather(city: str = "", day: str = "今天") -> str:
         rain = d["precipitation_probability_mean"][offset]
         return (f"{place}{day_cn}：{desc}，最高 {d['temperature_2m_max'][offset]}℃ / 最低 {d['temperature_2m_min'][offset]}℃，"
                 f"降水概率 {rain}%")
-    except Exception as e:
-        return f"（天气暂时查不到：{e}）"
+    except Exception:
+        raise    # 失败交给外层 get_weather 统一熔断记账 + 降级文案
 
 @tool
 def get_current_time() -> str:
@@ -259,6 +331,9 @@ def _bing_search(query: str, count: int = 4) -> list[str]:
 def search_web(query: str) -> str:
     """联网搜索：查实时信息/新闻/概念/百科。query 是要搜的关键词，尽量简短。
     返回搜到的片段（可能为空）；没搜到就沿用返回的提示，不要自己编造结果。"""
+    # 熔断保护：搜索渠道连续失败时不再反复等待超时，直接降级提示
+    if not CB_SEARCH.allow():
+        return "（搜索服务暂时不可用，过几分钟再让我搜吧）"
     results = []
     # 1) 必应国内版（主要渠道，国内直连稳定）
     try:
@@ -302,7 +377,9 @@ def search_web(query: str) -> str:
     except Exception:
         pass
     if not results:
+        CB_SEARCH.record_failure()
         return "（没搜到相关内容。可以换个关键词再让我搜一次，或者把问题说得更具体些。）"
+    CB_SEARCH.record_success()
     return "\n".join(results)
 
 def get_default_city() -> str:
@@ -709,19 +786,19 @@ def make_startup_briefing() -> str:
         fallback.append(f"最近的日程：「{schs[0]['text']}」在 {schs[0]['at'].strftime('%m月%d日 %H:%M')}。")
 
     try:
-        ai = chat_model.invoke([
+        ai = _invoke_model(lambda: chat_model.invoke([
             SystemMessage(content=(
                 "你是私人助理，刚启动时要主动向用户汇报。下面是确定性的数据。\n"
                 "要求：先按时段问好，再用自然、亲切、简短的口吻把这些要点说给用户，2~3 句。\n"
                 "只能使用数据里的事实，不许编造数字或事项。输出纯文本，不要任何标记或列表符号。"
             )),
             HumanMessage(content="\n".join(data_lines)),
-        ])
+        ]))
         text = (ai.content or "").strip()
         if text:
             return text
     except Exception:
-        pass
+        pass    # 模型失败/熔断：走下面的确定性模板，绝不卡启动
     return "\n".join(fallback)
 
 
@@ -779,7 +856,7 @@ def make_morning_report() -> str:
         fallback.append("今天没有设提醒。")
 
     try:
-        ai = chat_model.invoke([
+        ai = _invoke_model(lambda: chat_model.invoke([
             SystemMessage(content=(
                 "你是私人助理，正在为用户出一份『每日晨报』。数据已由程序确定性收集（真实数据，绝对不许编造）。\n"
                 f"要求输出一段自然、有条理、亲切的晨报，按这个顺序组织：\n"
@@ -792,12 +869,12 @@ def make_morning_report() -> str:
                 "只使用数据里的事实，查不到或没有就说没有。输出纯文本，不要标题和列表符号。"
             )),
             HumanMessage(content="\n".join(data_lines)),
-        ])
+        ]))
         text = (ai.content or "").strip()
         if text:
             return text
     except Exception:
-        pass
+        pass    # 模型失败/熔断：走模板晨报，绝不卡住
     return "\n".join(fallback)
 
 @tool
@@ -1007,7 +1084,12 @@ class AsstState(TypedDict):
     tidied: str         # 记忆整理员本轮整理的结果（空串表示没整理）
 
 def receptionist_node(state: AsstState) -> dict:
-    result = receptionist.invoke({"messages": state["messages"]})
+    """『前台』：听懂用户要做什么，分流转给聊天/整理/办事。
+    模型失败/熔断时直接分流到『办事』（规则法，保住记/忘/待办/提醒等核心能力）。"""
+    try:
+        result = _invoke_model(lambda: receptionist.invoke({"messages": state["messages"]}))
+    except Exception:
+        return {"messages": state["messages"] + [AIMessage(content="执行")]}
     return {"messages": result["messages"]}
 
 def digest_title(raw: str) -> str:
@@ -1083,9 +1165,9 @@ def summarize_recent_chat(history: list) -> str:
         )),
     ] + list(history[-16:])
     try:
-        ai = chat_model.invoke(ctx)
+        ai = _invoke_model(lambda: chat_model.invoke(ctx))
     except Exception:
-        return ""
+        return ""    # 模型失败/熔断：这次总结先不做，下次再说
     summary = (ai.content or "").strip()
     if not summary:
         return ""
@@ -1246,7 +1328,11 @@ def executor_node(state: AsstState) -> dict:
     return {"messages": [HumanMessage(content=note)]}
 
 def secretary_node(state: AsstState) -> dict:
-    result = secretary.invoke({"messages": state["messages"]})
+    """『秘书』：把办事员的结果组织成一句温和的答话。模型失败/熔断时原样转达。"""
+    try:
+        result = _invoke_model(lambda: secretary.invoke({"messages": state["messages"]}))
+    except Exception:
+        return {"messages": state["messages"]}    # 原样转达办事员的 note，不加工
     return {"messages": result["messages"]}
 
 @tool
@@ -1292,6 +1378,44 @@ def run_side_effects(user_raw: str) -> str:
         hints.append("[已记住助理名字] " + named)
     return "\n".join(hints)
 
+def _chat_system_prompt(long_mem: str, system_extra: str = "", name_hint: str = "") -> str:
+    """『聊天』的人设（流式路径与团队链共用，避免两份文本漂移）。"""
+    return (
+        "你是私人助理团队里的『聊天』担当，语气温柔，回答简短自然。\n"
+        "你有几个工具可用：查天气(get_weather，可查今天/明天/后天)、算数(calculate)、查当前时间(get_current_time)、"
+        "看待办清单(list_todos_tool)、联网搜索(search_web)、每日晨报(morning_report)、"
+        "设提醒(set_reminder)、加待办(add_todo_item)、"
+        "记日程(add_schedule)、查日程(list_schedule_tool)。"
+        "遇到实时新闻/概念/百科类问题用 search_web 搜一下再回答；用户要你设置提醒/加待办/记日程时用对应工具真实执行。\n"
+        "用户说『每日晨报』『今日晨报』『看晨报』『汇报今天的安排』时就调 morning_report 生成；"
+        "多工具任务示例：用户说『明天下雨就提醒我带伞』→ 第一步调 get_weather 查明天降水概率 → "
+        "第二步根据结果决定：会下雨才调 set_reminder（text 只写『带伞』，when 用用户给的时间，没给就用明天8点这种合理时间）；"
+        "不下雨就直接告诉用户明天不用带伞。用户一次说多件事的待办，要拆开、对每件事分别调一次 add_todo_item。\n"
+        "联动技巧：用户问某天的天气或安排时，可以顺带用 list_schedule_tool 查那天有没有日程，"
+        "有的话结合天气给建议（如下雨建议改室内或带伞）；用户说『把X安排到某天』就用 add_schedule。\n"
+        "没搜到就说没搜到，不要自己心算或瞎编数据。搜索技巧：用 2~4 个字的核心关键词（去掉『听说/吗/了』等虚词），"
+        "第一轮搜到的内容不相关时，换个更短的关键词再搜一轮再作答。\n"
+        "下面这些是用户之前让你记住的信息，聊到相关话题时自然地引用，"
+        "不知道的事就直说不知道，不要编造。\n"
+        f"{long_mem}{system_extra}{name_hint}"
+    )
+
+
+def _build_chat_msgs(user_raw: str, history: list, extra: str = "") -> list:
+    """构建『聊天』的输入消息（与 chat_node 一致；extra 是兜底写操作/总结的提示）。"""
+    long_mem = load_long_memory()
+    system_extra = ""
+    if fire_log():                        # 后台已经响过的提醒，要让聊天席知道，别再说"还在等"
+        system_extra = f"\n系统近况（已发生的事，别把它当未来计划）：{'；'.join(fire_log())}"
+    asst_name = get_assistant_name()
+    name_hint = f"\n你（助理）的名字叫『{asst_name}』，用户问起你的名字要回答这个。" if asst_name else ""
+    msgs = [SystemMessage(content=_chat_system_prompt(long_mem, system_extra, name_hint))]
+    msgs += list(history or []) + [HumanMessage(content=user_raw)]
+    if extra:
+        msgs.append(HumanMessage(content=f"[刚刚已执行的操作] {extra}"))
+    return msgs
+
+
 def chat_node(state: AsstState) -> dict:
     """『聊天』节点（真·工具 Agent 循环）：
     模型自己判断要不要调工具 → 若调用，Python 确定性执行 → 结果还给模型 → 直到给出最终回答。
@@ -1308,27 +1432,7 @@ def chat_node(state: AsstState) -> dict:
     asst_name = get_assistant_name()
     name_hint = f"\n你（助理）的名字叫『{asst_name}』，用户问起你的名字要回答这个。" if asst_name else ""
     msgs: list = [
-        SystemMessage(
-            content=(
-                "你是私人助理团队里的『聊天』担当，语气温柔，回答简短自然。\n"
-                "你有几个工具可用：查天气(get_weather，可查今天/明天/后天)、算数(calculate)、查当前时间(get_current_time)、"
-                "看待办清单(list_todos_tool)、联网搜索(search_web)、每日晨报(morning_report)、"
-                "设提醒(set_reminder)、加待办(add_todo_item)、"
-                "记日程(add_schedule)、查日程(list_schedule_tool)。"
-                "遇到实时新闻/概念/百科类问题用 search_web 搜一下再回答；用户要你设置提醒/加待办/记日程时用对应工具真实执行。\n"
-                "用户说『每日晨报』『今日晨报』『看晨报』『汇报今天的安排』时就调 morning_report 生成；"
-                "多工具任务示例：用户说『明天下雨就提醒我带伞』→ 第一步调 get_weather 查明天降水概率 → "
-                "第二步根据结果决定：会下雨才调 set_reminder（text 只写『带伞』，when 用用户给的时间，没给就用明天8点这种合理时间）；"
-                "不下雨就直接告诉用户明天不用带伞。用户一次说多件事的待办，要拆开、对每件事分别调一次 add_todo_item。\n"
-                "联动技巧：用户问某天的天气或安排时，可以顺带用 list_schedule_tool 查那天有没有日程，"
-                "有的话结合天气给建议（如下雨建议改室内或带伞）；用户说『把X安排到某天』就用 add_schedule。\n"
-                "没搜到就说没搜到，不要自己心算或瞎编数据。搜索技巧：用 2~4 个字的核心关键词（去掉『听说/吗/了』等虚词），"
-                "第一轮搜到的内容不相关时，换个更短的关键词再搜一轮再作答。\n"
-                "下面这些是用户之前让你记住的信息，聊到相关话题时自然地引用，"
-                "不知道的事就直说不知道，不要编造。\n"
-                f"{long_mem}{system_extra}{name_hint}"
-            )
-        ),
+        SystemMessage(content=_chat_system_prompt(long_mem, system_extra, name_hint)),
     ] + list(state.get("history", [])) + [HumanMessage(content=user_raw)]
 
     # 0) 关键『写』操作的兜底（加待办/设提醒/设默认城市）——确定性落盘，绝不交给模型写
@@ -1343,9 +1447,19 @@ def chat_node(state: AsstState) -> dict:
 
     # 1) 模型自主调工具的主循环（bind_tools：给模型看工具说明书，让它自己决定）
     final = None
+    # 模型熔断：不再反复尝试卡时间，直接降级答复（工具帮手的兜底在上面已执行过）
+    if not CB_MODEL.allow():
+        return {"messages": [HumanMessage(content=user_raw),
+                             AIMessage(content="（我暂时连不上思考后台，缓几分钟再聊～ 记事情、查待办、设提醒这些照常能用）")]}
     llm = chat_model.bind_tools(CHAT_TOOLS, tool_choice="auto")
     for _ in range(3):
-        ai = llm.invoke(msgs)
+        try:
+            ai = llm.invoke(msgs)
+        except Exception:
+            CB_MODEL.record_failure()
+            return {"messages": [HumanMessage(content=user_raw),
+                                 AIMessage(content="（这次回答时出了点岔子，稍等一分钟再问我一次？）")]}
+        CB_MODEL.record_success()
         msgs.append(ai)
         if getattr(ai, "tool_calls", None):
             for tc in ai.tool_calls:
@@ -1363,6 +1477,103 @@ def chat_node(state: AsstState) -> dict:
                              AIMessage(content="（我有点绕晕了，你换个说法再问我一次？）")]}
     return {"messages": [HumanMessage(content=user_raw), final]}
 
+
+# 工具名的中文小提示（流式输出时给用户看到"接下来在干什么"）
+_TOOL_STATUS_NAMES = {
+    "calculate": "算数", "get_weather": "查天气", "get_current_time": "看时间",
+    "list_todos_tool": "看待办", "search_web": "联网搜索", "morning_report": "生成晨报",
+    "set_reminder": "设提醒", "add_todo_item": "加待办",
+    "add_schedule": "记日程", "list_schedule_tool": "查日程",
+}
+
+
+def stream_reply(user_raw: str, history: list):
+    """流式对话入口：逐块 yield (kind, payload)。
+      · ('token', 文本)  —— 回答逐字流（打字机效果）
+      · ('status', 文本) —— 工具执行中的副提示（如"正在查天气…"）
+      · ('memorized', 内容) —— 聊天结束后自动摘记的结果
+    聊天：真·流式（模型边生成边吐，工具轮次在后台确定性执行）；
+    记忆/待办/提醒等命令：规则法办事，短回复一次性给出。熔断/失败时降级不卡死。"""
+    user_raw = (user_raw or "").strip()
+    if not user_raw:
+        return
+    # 前台分流：模型判定 聊天/整理/办事（失败或熔断 → 交给规则法办事员，保住写能力）
+    verdict = ""
+    try:
+        result = _invoke_model(lambda: receptionist.invoke({"messages": [HumanMessage(content=user_raw)]}))
+        last = result["messages"][-1]
+        verdict = (getattr(last, "content", None) or "").strip()
+    except Exception:
+        verdict = ""
+    if not verdict.startswith("聊天"):
+        # —— 记忆/待办/提醒/整理 等命令：规则法办事（短回复一次性给出）——
+        try:
+            st = {"messages": [HumanMessage(content=user_raw)],
+                  "history": list(history or []), "memorized": "", "tidied": ""}
+            out = executor_node(st)
+            note = ""
+            for m in reversed(out.get("messages", [])):
+                if getattr(m, "content", None):
+                    note = m.content
+                    break
+        except Exception as e:
+            note = f"（处理时出了点小问题，稍后再试。{e}）"
+        yield ("token", note or "（这条我暂时没处理明白，换个说法试试？）")
+        return
+
+    # —— 聊天路径：真·流式打字机（工具轮次在后台跑，最终回答逐字流出）——
+    side = run_side_effects(user_raw)                       # 写操作兜底（默认城市/助理名字）
+    extra = side
+    if ("总结" in user_raw or "纪要" in user_raw) and any(w in user_raw for w in ("对话", "聊", "刚才", "我们")):
+        s = summarize_recent_chat(list(history or []))      # 对话总结兜底存档
+        if s:
+            extra = (extra + "\n" if extra else "") + f"[对话总结已存档] {s}"
+    if not CB_MODEL.allow():
+        yield ("token", "（我暂时连不上思考后台，缓几分钟再聊～ 记事情、查待办、设提醒这些照常能用）")
+        return
+    llm = chat_model.bind_tools(CHAT_TOOLS, tool_choice="auto")
+    msgs = _build_chat_msgs(user_raw, history, extra)
+    answered = False
+    for _ in range(3):
+        acc = None
+        try:
+            for chunk in llm.stream(msgs):
+                acc = chunk if acc is None else acc + chunk
+                txt = chunk.content if isinstance(chunk.content, str) else ""
+                if txt:
+                    yield ("token", txt)
+        except Exception:
+            CB_MODEL.record_failure()
+            yield ("token", "（这次回答时出了点岔子，稍等一分钟再问我一次？）")
+            return
+        if acc is None:
+            break
+        CB_MODEL.record_success()
+        msgs.append(acc)
+        tcs = getattr(acc, "tool_calls", None) or []
+        if not tcs:
+            answered = True
+            break
+        for tc in tcs:                                        # 工具轮：确定性执行后回填，继续让模型说
+            name = tc.get("name", "")
+            yield ("status", f"（正在{_TOOL_STATUS_NAMES.get(name, name)}…）")
+            try:
+                out = CHAT_TOOL_REGISTRY[name].invoke(tc.get("args") or {})
+            except Exception as e:
+                out = f"（工具执行出错：{e}）"
+            msgs.append(ToolMessage(content=str(out), name=name, tool_call_id=tc.get("id", "")))
+    if not answered:
+        yield ("token", "（我有点绕晕了，你换个说法再问我一次？）")
+        return
+    # 聊完自动摘记（模型只判断，落盘由 Python 执行）
+    try:
+        ex = extractor_node({"messages": [HumanMessage(content=user_raw)],
+                             "history": list(history or []), "memorized": "", "tidied": ""})
+        if ex.get("memorized"):
+            yield ("memorized", ex["memorized"])
+    except Exception:
+        pass
+
 def extractor_node(state: AsstState) -> dict:
     """『记忆秘书』节点：聊天结束后，把话里值得记的用户信息摘记落盘。
     模型只负责『判断』，真正的文件写入由 Python 执行，防止小模型假执行。"""
@@ -1373,7 +1584,10 @@ def extractor_node(state: AsstState) -> dict:
             break
     # 给摘记一点上下文：最近几轮对话 + 本轮，让它能接住「她」「刚才说的」这类指代
     ctx = list(state.get("history", []))[-6:] + [HumanMessage(content=user_raw)]
-    out = extractor.invoke({"messages": ctx})
+    try:
+        out = _invoke_model(lambda: extractor.invoke({"messages": ctx}))
+    except Exception:
+        return {"memorized": ""}    # 模型失败/熔断：这轮先不摘记，不影响已完成的聊天回复
     directive = ""
     for m in reversed(out["messages"]):
         if m.type == "ai" and not m.tool_calls and m.content:
@@ -1413,7 +1627,11 @@ def run_tidy() -> str:
     if len(items) < 3:
         return ""          # 没几条，没必要整理
     listing = "\n".join(f"- {it['title']}：{it['content']}（记于 {it['time'] or '未知'}）" for it in items)
-    out = organizer.invoke({"messages": [HumanMessage(content=f"当前记忆清单如下：\n{listing}")]})
+    try:
+        out = _invoke_model(lambda: organizer.invoke(
+            {"messages": [HumanMessage(content=f"当前记忆清单如下：\n{listing}")]}))
+    except Exception:
+        return ""          # 模型失败/熔断：这次先不整理，改天再说
     directive = ""
     for m in reversed(out["messages"]):
         if m.type == "ai" and not m.tool_calls and m.content:
@@ -1524,20 +1742,20 @@ if __name__ == "__main__":
         if not text:
             continue
 
-        # 交给团队：本轮输入 + 之前的对话历史（长线记忆由文件负责，重启不忘）
-        result = team.invoke({
-            "messages": [HumanMessage(content=text)],
-            "history": history,
-            "memorized": "",
-            "tidied": "",
-        })
-
-        # 找出本轮最后的回答（记忆命令→秘书说的；闲聊→聊天节点说的）
-        final_reply = ""
-        for m in reversed(result["messages"]):
-            if m.type == "ai" and not m.tool_calls and m.content:
-                final_reply = m.content
-                break
+        # 流式对话：回答逐字打出（打字机效果），工具状态单独换行显示
+        final_parts: list = []
+        memorized = ""
+        print("助理：", end="", flush=True)
+        for kind, payload in stream_reply(text, history):
+            if kind == "token":
+                final_parts.append(payload)
+                print(payload, end="", flush=True)
+            elif kind == "status":
+                print("\n   🛠 " + payload)
+            elif kind == "memorized":
+                memorized = payload
+        print()
+        final_reply = "".join(final_parts)
 
         # 若本条是"回忆"，直接把记忆原文打印出来，保证用户一定看到真相
         if any(w in text for w in RECALL_HINTS) or (
@@ -1546,18 +1764,17 @@ if __name__ == "__main__":
             raw_mem = recall_all.invoke({})
             print("   📒 原始记忆：", raw_mem.replace("\n", "；").strip())
 
-        # 把这一来一回记进短线历史（最早的超了窗口就丢），并回显给用户
+        # 把这一来一回记进短线历史（最早的超了窗口就丢）
         if final_reply:
             history = (history + [HumanMessage(content=text), AIMessage(content=final_reply)])[-MAX_HISTORY:]
-            print("助理：", final_reply)
 
         # 记忆秘书摘记了什么，补一句让用户知道
-        if result.get("memorized"):
-            print("   🧠 已摘记：", result["memorized"])
+        if memorized:
+            print("   🧠 已摘记：", memorized)
 
         # 定期自动整理：聊到整轮数时，悄悄把记忆归拢一遍（本轮刚手动整理过就跳过，避免重复）
         turn += 1
-        if turn % AUTO_TIDY_EVERY == 0 and not result.get("tidied"):
+        if turn % AUTO_TIDY_EVERY == 0:
             auto = run_tidy()
             if auto:
                 print("   🧹 自动整理：", auto)

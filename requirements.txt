@@ -3,5 +3,3 @@ uvicorn
 langchain
 langgraph
 langchain-deepseek
-fastembed
-numpy

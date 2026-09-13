@@ -1,0 +1,7 @@
+# 可选增强：记忆的向量语义检索（真·RAG）
+# 不装也能用——程序会自动降级为轻量关键词检索（bigram）。
+# 装了之后，首次在项目里检索记忆时自动下载 ~100MB 中文模型到 models/ 目录（之后离线）。
+# 安装：pip install -r requirements-rag.txt
+# 国内网络可先执行：$env:HF_ENDPOINT = "https://hf-mirror.com"
+fastembed
+numpy

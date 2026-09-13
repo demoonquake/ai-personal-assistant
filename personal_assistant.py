@@ -73,7 +73,7 @@ def fire_log() -> list:
     return _USER_CTX.fire_log
 
 # 这三份是"数据表"（待办/提醒/日程），外加助理自己的名字——不算用户记忆：回忆、长期记忆、整理员都不得读改它们
-NON_MEMORY_FNS = {"todo.md", "reminders.md", "schedule.md", "助理名字.md"}
+NON_MEMORY_FNS = {"todo.md", "reminders.md", "schedule.md", "助理名字.md", "说话风格.md"}
 
 
 # ---------------------------------------------------------------
@@ -408,6 +408,43 @@ def remember_assistant_name(raw: str) -> str:
     # 误伤防护：像"你叫什么名字"这种问句跑不到这（前面有问句拦截）；这里只认祈使/陈述
     save_note.invoke({"title": "助理名字", "content": name})
     return f"已把『助理自己的名字』设为「{name}」（用户的名字保持原样未动）"
+
+
+# ---------------------------------------------------------------
+# 1.51) 人设：说话风格（助理设置，可调）+ 情绪快照（最新心情，聊天时体贴带上）
+# ---------------------------------------------------------------
+def get_user_mood() -> str:
+    """读回用户最近的情绪快照（情绪.md），没有返回空串。"""
+    path = os.path.join(user_dir(), "情绪.md")
+    if os.path.exists(path):
+        with open(path, encoding="utf-8") as f:
+            content, _ = unpack_note(f.read())
+        return content.strip()
+    return ""
+
+def get_speech_style() -> str:
+    """读回助理的说话风格（说话风格.md，用户可改）；没设置就用默认温柔风。"""
+    path = os.path.join(user_dir(), "说话风格.md")
+    if os.path.exists(path):
+        with open(path, encoding="utf-8") as f:
+            content, _ = unpack_note(f.read())
+        if content.strip():
+            return content.strip()
+    return "语气温柔，回答简短自然"
+
+def set_speech_style(raw: str) -> str:
+    """识别『把说话风格设为X』『说话可爱点』『语气放高冷些』，写入 说话风格.md。
+    命中返回结果文本，没命中返回空串。"""
+    m = re.search(r"(?:把说话风格|说话风格|语气|说话)(?:设为|改成|改为|换成|调整成?|变得|调成?|改成)[：:是]?\s*([\u4e00-\u9fa5A-Za-z0-9，,、]{2,24})", raw)
+    style = m.group(1).strip().strip("，,。") if m else ""
+    if not style:
+        m2 = re.search(r"(?:说话|回话|回答|语气)[：:是]?\s*([\u4e00-\u9fa5]{2,6})(?:点|一些|一点|些|起来|一点更)", raw)
+        if m2:
+            style = m2.group(1).strip("点一些起来") + "一点"
+    if not style:
+        return ""
+    save_note.invoke({"title": "说话风格", "content": style})
+    return f"好嘞，以后我说话就『{style}』啦"
 
 
 # ---------------------------------------------------------------
@@ -1171,15 +1208,18 @@ extractor = create_agent(
     model=extractor_model,
     tools=[],            # 记忆秘书只看不说做，落盘由 Python 执行
     system_prompt=(
-        "你是私人助理的记忆秘书，负责在每轮聊天后『摘记』值得长期记住的用户信息。"
+        "你是私人助理的记忆秘书，负责在每轮聊天后『摘记』值得长期记住的用户信息与情绪。"
         "你会看到用户刚刚说的话（带一点对话上下文）。"
-        "【严格规则】只输出下面两种格式之一，每行一条，不要加任何别的字：\n"
+        "【严格规则】只输出下面的行，每行一条，不要加任何别的字：\n"
         "1. 话里有值得长期记住的用户信息（关于用户本人的：事实/喜好/重要经历/正在经历的事/计划约定等）"
         " → 输出：记→标题名|内容\n"
-        "2. 只是客套、寒暄、情绪发泄、给助理起名、问问题，或信息太琐碎不值得记 → 输出：无\n"
+        "2. 用户这轮有明显情绪/状态（高兴/难过/焦虑/疲惫/委屈/兴奋…），且值得助理后续关心体贴"
+        " → 输出：情绪→一句简短描述（如『情绪→最近压力大，心情有点低落』『情绪→比赛赢了，特别开心』）\n"
+        "3. 只是客套、寒暄、日常小事、给助理起名、问问题 → 输出：无\n"
         "注意：标题要具体（如『前女友』『咖啡喜好』『最近的工作』），不要用『爱好/备注/记录/喜好』这类笼统词；"
         "只记关于用户的重要信息，不记废话；一句话里有多个要点就拆成多行输出。\n"
         "示例：用户说『最近被前女友伤透了心，她叫小雨』→ 记→前女友|用户被前女友小雨伤透了心\n"
+        "                              情绪→被分手了，情绪很低落\n"
         "      用户说『今天天气不错啊』→ 无"
     ),
 )
@@ -1382,6 +1422,9 @@ def executor_node(state: AsstState) -> dict:
             note = f"工具返回：{out}"
         else:
             note = "（默认城市想设成哪儿呢？）"
+    elif (style_note := set_speech_style(user_raw)):
+        # 说话风格：『说话风格换成高冷』『说话可爱点』→ 写 说话风格.md（助理设置，不进用户记忆）
+        note = style_note
     elif any(w in user_raw for w in ("总结", "纪要")) and any(w in user_raw for w in ("对话", "聊", "刚才", "我们")):
         # 对话总结：把最近这段对话提炼存档（模型出稿，Python 落盘）
         s = summarize_recent_chat(state.get("history", []))
@@ -1504,12 +1547,22 @@ def run_side_effects(user_raw: str) -> str:
     # 给助理起名：聊天路径兜底（存入助理名字槽，不碰用户名字）
     if (named := remember_assistant_name(user_raw)):
         hints.append("[已记住助理名字] " + named)
+    # 说话风格：『把说话风格设为X』『说话可爱点』→ 写 说话风格.md（助理设置，不进用户记忆）
+    if (style := set_speech_style(user_raw)):
+        hints.append("[已更新说话风格] " + style)
     return "\n".join(hints)
 
 def _chat_system_prompt(long_mem: str, system_extra: str = "", name_hint: str = "") -> str:
-    """『聊天』的人设（流式路径与团队链共用，避免两份文本漂移）。"""
+    """『聊天』的人设（流式路径与团队链共用，避免两份文本漂移）。
+    说话风格（用户可调）与最近情绪快照自动带进来，让助理有稳定人设、也懂用户心情。"""
+    style = get_speech_style()
+    mood_hint = ""
+    mood = get_user_mood()
+    if mood:
+        mood_hint = (f"\n用户最近的情绪/状态：{mood}。"
+                     "聊到相关话题时自然体贴地回应，但别假设用户没细说的细节。")
     return (
-        "你是私人助理团队里的『聊天』担当，语气温柔，回答简短自然。\n"
+        f"你是私人助理团队里的『聊天』担当，说话风格：{style}。\n"
         "你有几个工具可用：查天气(get_weather，可查今天/明天/后天)、算数(calculate)、查当前时间(get_current_time)、"
         "看待办清单(list_todos_tool)、联网搜索(search_web)、每日晨报(morning_report)、"
         "设提醒(set_reminder)、加待办(add_todo_item)、"
@@ -1525,7 +1578,7 @@ def _chat_system_prompt(long_mem: str, system_extra: str = "", name_hint: str = 
         "第一轮搜到的内容不相关时，换个更短的关键词再搜一轮再作答。\n"
         "下面这些是用户之前让你记住的信息，聊到相关话题时自然地引用，"
         "不知道的事就直说不知道，不要编造。\n"
-        f"{long_mem}{system_extra}{name_hint}"
+        f"{long_mem}{system_extra}{name_hint}{mood_hint}"
     )
 
 
@@ -1647,6 +1700,13 @@ def stream_reply(user_raw: str, history: list):
         except Exception as e:
             note = f"（处理时出了点小问题，稍后再试。{e}）"
         yield ("token", note or "（这条我暂时没处理明白，换个说法试试？）")
+        # 记忆反思：刚写入/操作了新信息，对账相关旧记忆，过时/冲突自动修正
+        try:
+            rp = reflect_memory(user_raw, list(history or []))
+            if rp:
+                yield ("status", f"🧠 记忆已自动更新：{rp}")
+        except Exception:
+            pass
         return
 
     # —— 聊天路径：真·流式打字机（工具轮次在后台跑，最终回答逐字流出）——
@@ -1701,6 +1761,13 @@ def stream_reply(user_raw: str, history: list):
             yield ("memorized", ex["memorized"])
     except Exception:
         pass
+    # 记忆反思：新信息 vs 旧记忆，过时/冲突自动修正（摘记之后做，保证先落盘再对账）
+    try:
+        rp = reflect_memory(user_raw, list(history or []))
+        if rp:
+            yield ("status", f"🧠 记忆已自动更新：{rp}")
+    except Exception:
+        pass
 
 def extractor_node(state: AsstState) -> dict:
     """『记忆秘书』节点：聊天结束后，把话里值得记的用户信息摘记落盘。
@@ -1723,8 +1790,12 @@ def extractor_node(state: AsstState) -> dict:
             break
     saved = []
     seen = set()          # 同一轮里同标题只存一次，避免重复覆盖
+    mood = ""
     for line in directive.splitlines():
         line = line.strip()
+        if line.startswith("情绪→") and len(line) > 3:
+            mood = line[line.index("→") + 1:].strip().strip("，,。！!。")
+            continue
         if line.startswith("记→") and "|" in line:
             title, content = line[2:].split("|", 1)
             title = title.strip()
@@ -1733,6 +1804,8 @@ def extractor_node(state: AsstState) -> dict:
             seen.add(title)
             res = save_note.invoke({"title": title, "content": content.strip()})
             saved.append(str(res))
+    if mood:
+        save_note.invoke({"title": "情绪", "content": mood})   # 心情快照：最新一次覆盖
     # 不追加 messages：保持聊天席那句回答作为本轮最终回复；摘记结果单独上报
     return {"memorized": "；".join(saved) if saved else ""}
 
@@ -1746,6 +1819,50 @@ def list_notes() -> list[dict]:
                 content, ts = unpack_note(f.read())
             items.append({"title": fn[:-3], "content": content, "time": ts})
     return items
+
+
+# 核心记忆（名字/默认城市/助理名字）：整理与反思都禁止删除/合并（标题级保护，防止误伤唯一信息）
+_MEM_PROTECTED = set(MEMORY_ALWAYS_KEEP) | {"助理名字"}
+
+def apply_memory_directives(directive: str) -> str:
+    """把模型输出的整理/反思指令（合并→ / 删除→ / 更新→）确定性执行，返回报告。
+    核心记忆禁止删除/合并；『更新』只允许改已存在的笔记（不拿模型内容乱建新笔记）。"""
+    report = []
+    for line in directive.splitlines():
+        line = line.strip().lstrip("-* ")
+        if line.startswith("合并→"):
+            parts = line[len("合并→"):].split("|", 2)
+            if len(parts) != 3:
+                continue
+            olds = [p.strip() for p in parts[0].split("+")]
+            new_title, new_content = parts[1].strip(), parts[2].strip()
+            if new_title in _MEM_PROTECTED or any(t in _MEM_PROTECTED for t in olds):
+                report.append(f"跳过合并（核心记忆防删）：{'+'.join(olds)}")
+                continue
+            exist = [t for t in olds if os.path.exists(os.path.join(user_dir(), f"{t}.md"))]
+            if exist and new_title:
+                for t in olds:
+                    forget.invoke({"title": t})
+                save_note.invoke({"title": new_title, "content": new_content})
+                report.append(f"合并 {'+'.join(olds)} → {new_title}")
+        elif line.startswith("删除→"):
+            t = line[len("删除→"):].strip()
+            if t in _MEM_PROTECTED:
+                report.append(f"跳过删除核心记忆：{t}")
+                continue
+            if "已忘记" in str(forget.invoke({"title": t})):
+                report.append(f"删除 {t}")
+        elif line.startswith("更新→"):
+            parts = line[len("更新→"):].split("|", 1)
+            if len(parts) != 2:
+                continue
+            title, content = parts[0].strip(), parts[1].strip()
+            if not os.path.exists(os.path.join(user_dir(), f"{title}.md")):
+                report.append(f"跳过更新（没存过这条）：{title}")
+                continue
+            update_note.invoke({"title": title, "content": content})
+            report.append(f"更新 {title}")
+    return "；".join(report) if report else ""
 
 
 def run_tidy() -> str:
@@ -1765,30 +1882,52 @@ def run_tidy() -> str:
         if m.type == "ai" and not m.tool_calls and m.content:
             directive = m.content
             break
-    report = []
-    for line in directive.splitlines():
-        line = line.strip().lstrip("-* ")
-        if line.startswith("合并→"):
-            parts = line[len("合并→"):].split("|", 2)
-            if len(parts) == 3:
-                olds = [p.strip() for p in parts[0].split("+")]
-                new_title, new_content = parts[1].strip(), parts[2].strip()
-                exist = [t for t in olds if os.path.exists(os.path.join(user_dir(), f"{t}.md"))]
-                if exist and new_title:
-                    for t in olds:
-                        forget.invoke({"title": t})
-                    save_note.invoke({"title": new_title, "content": new_content})
-                    report.append(f"合并 {'+'.join(olds)} → {new_title}")
-        elif line.startswith("删除→"):
-            t = line[len("删除→"):].strip()
-            if "已忘记" in str(forget.invoke({"title": t})):
-                report.append(f"删除 {t}")
-        elif line.startswith("更新→"):
-            parts = line[len("更新→"):].split("|", 1)
-            if len(parts) == 2:
-                update_note.invoke({"title": parts[0].strip(), "content": parts[1].strip()})
-                report.append(f"更新 {parts[0].strip()}")
-    return "；".join(report) if report else ""
+    return apply_memory_directives(directive)
+
+
+# ---- 记忆反思员：每轮聊完后，用『最新对话』对账『相关旧记忆』，过时/冲突自动修正 ----
+_reflect_agent = None
+
+def _get_reflect_agent():
+    global _reflect_agent
+    if _reflect_agent is None:
+        _reflect_agent = create_agent(
+            model=chat_model, tools=[],
+            system_prompt=(
+                "你是私人助理里的『记忆反思员』，负责发现记忆中的过时/冲突信息。\n"
+                "你会看到：1) 用户最新说的几句话；2) 相关的旧记忆（每条 - 标题：内容）。\n"
+                "任务：判断新说法是否让旧记忆【过时或冲突】——例如用户换了城市/工作/学校、"
+                "结束或改变了某段关系、某个计划已经变了/结束了。\n"
+                "【严格规则】只输出下面格式之一，每行一条，不要任何多余的字：\n"
+                "更新→标题|新的完整内容（内容必须来自用户最新说法，不许编造）\n"
+                "删除→标题\n"
+                "如果新说法与旧记忆不冲突、只是补充或无关 → 输出：无\n"
+                "注意：宁可漏判，不可错改；只能更新【已存在】的记忆标题；"
+                "标题含『名字/默认城市』的核心记忆只能更新内容、绝不能删除或改名。"
+            ))
+    return _reflect_agent
+
+def reflect_memory(user_raw: str, history: list) -> str:
+    """记忆反思：拿『最新对话』对账『相关旧记忆』，发现过时/冲突就自动更新或删除。"""
+    ctx_parts = [user_raw]
+    for m in list(history or [])[-4:]:
+        if getattr(m, "type", "") == "human" and getattr(m, "content", None):
+            ctx_parts.append(m.content)
+    old = retrieve_memory(" ".join(p for p in ctx_parts if p), top_k=5)
+    if not old or old == "（暂无记忆）":
+        return ""
+    try:
+        out = _invoke_model(lambda: _get_reflect_agent().invoke({
+            "messages": [HumanMessage(
+                content=f"用户最新说法：\n" + "\n".join(ctx_parts) + f"\n\n相关的旧记忆：\n{old}")]}))
+    except Exception:
+        return ""          # 模型失败/熔断：反思这轮先跳，不影响已有回复
+    directive = ""
+    for m in reversed(out["messages"]):
+        if m.type == "ai" and not m.tool_calls and m.content:
+            directive = m.content
+            break
+    return apply_memory_directives(directive)
 
 
 def organizer_node(state: AsstState) -> dict:

@@ -67,3 +67,56 @@ body {
   font-family: inherit;
 }
 #send:hover { background: #3d3d3d; }
+
+/* 登录浮层 */
+.overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.72);
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  z-index: 10;
+}
+.overlay.hidden { display: none; }
+
+.card {
+  background: #262626;
+  border: 1px solid #3a3a3a;
+  border-radius: 12px;
+  padding: 28px 30px;
+  width: min(340px, 88vw);
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.card h2 { color: #4fc3f7; font-size: 20px; text-align: center; }
+.card .hint { color: #9aa0a6; font-size: 12.5px; text-align: center; }
+
+.card input {
+  background: #1e1e1e;
+  border: 1px solid #3a3a3a;
+  border-radius: 6px;
+  color: #e0e0e0;
+  padding: 10px 12px;
+  font-size: 14px;
+  outline: none;
+  font-family: inherit;
+}
+.card input:focus { border-color: #4fc3f7; }
+
+.row { display: flex; gap: 8px; }
+.row button {
+  flex: 1;
+  background: #2f7fd6;
+  color: #fff;
+  border: none;
+  border-radius: 6px;
+  padding: 10px 0;
+  font-size: 14px;
+  cursor: pointer;
+  font-family: inherit;
+}
+.row button:hover { background: #3b8ce8; }
+.row button.ghost { background: #333; color: #ccc; }
+.err { color: #ff7d7d; font-size: 12.5px; text-align: center; min-height: 16px; }

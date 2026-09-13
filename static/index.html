@@ -3,10 +3,24 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>私人助理</title>
+  <title>私人助理 v0.2</title>
   <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
+  <div id="login" class="overlay hidden">
+    <div class="card">
+      <h2>🤵 私人助理</h2>
+      <p class="hint">每个人独立记忆 · 输入一个专属名字进入</p>
+      <input id="loginname" placeholder="用户名（字母/数字）" autocomplete="username">
+      <input id="loginpass" type="password" placeholder="密码（可留空）" autocomplete="current-password">
+      <div class="row">
+        <button id="loginbtn">进入</button>
+        <button id="logoutbtn" class="ghost hidden">退出登录</button>
+      </div>
+      <p id="loginerr" class="err"></p>
+    </div>
+  </div>
+
   <div id="app">
     <div id="head">
       <span id="title">🤵 私人助理</span>

@@ -1,6 +1,6 @@
-# 私人助理（AI Personal Assistant）
+# 私人助理（AI Personal Assistant）v0.2
 
-一个从零学习 Agent 开发过程中长出来的**桌面级私人助理**：有记忆、有日程、会用工具、能联网，支持终端 / 桌面窗口 / 浏览器三种使用方式。
+一个从零学习 Agent 开发过程中长出来的**桌面级私人助理**：有记忆、有日程、会用工具、能联网，支持终端 / 桌面窗口 / 浏览器三种使用方式。v0.2 起浏览器版支持**多用户**：每人独立记忆、互不可见。
 
 > 技术栈：Python 3.12 · LangChain + LangGraph · DeepSeek API · FastAPI · 原生 HTML/CSS/JS
 
@@ -18,6 +18,7 @@
 | 日程表 | 某天几点做什么，与天气、提醒联动 |
 | 主动汇报 | 启动时先开口：今日待办、提醒、最近的日程（有明日日程自动附明日天气） |
 | 人事分离 | 用户的名字与助理自己的名字分开存储，互不污染 |
+| **多用户（浏览器版）** | 用户名+可选密码登录，每人独立记忆/待办/提醒/日程，互不可见 |
 
 ## 🚀 快速开始
 
@@ -46,13 +47,22 @@ python server.py
 
 ```
 ├── personal_assistant.py   # 内核：团队编排 + 全部工具 + 记忆/待办/提醒/日程数据层
+│                           #（v0.2：数据层支持『每线程一个用户目录』的多用户切换）
 ├── assistant_gui.py        # 窗口版界面（Tkinter，三件套里最'桌面'的）
-├── server.py               # 浏览器版后端（FastAPI 薄封装，复用内核 team）
+├── server.py               # 浏览器版后端（FastAPI：v0.2 含注册/登录/token 鉴权）
 ├── static/                 # 浏览器版前端（index.html + style.css + app.js，纯原生）
 ├── requirements.txt        # 依赖清单
 ├── way.md                  # 启动/部署说明
-└── assistant_memory/       # 运行后生成：用户的记忆与数据（已 gitignore）
+├── data/                   # 运行后生成：浏览器版用户数据（users.json + 每用户目录，已 gitignore）
+└── assistant_memory/       # 运行后生成：终端/窗口版的单用户记忆（已 gitignore）
 ```
+
+## 👥 浏览器版多用户（v0.2 新增）
+
+打开页面先登录：输入一个**用户名**（字母/数字）+ 可选密码（留空 = 无密码保护）。
+- 首次输入即自动注册；密码用 SHA-256 加盐哈希存储（`data/users.json`）
+- 每人独立的数据目录 `data/users/<名字>/assistant_memory/`，记忆、待办、提醒、日程全部隔离
+- 登录态保存在浏览器 localStorage，重启服务后需重新登录（单机自用足够）
 
 ## 🧠 架构
 

@@ -6,6 +6,9 @@ __pycache__/
 # 用户数据（记忆、待办、提醒、日程、以及助理名字等个人信息）
 assistant_memory/
 
+# 浏览器版多用户数据（用户目录、users.json 全是隐私）
+data/
+
 # 密钥（绝不能上传）
 deepseek_key.txt
 *.env

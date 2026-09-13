@@ -52,6 +52,26 @@ else:
 MEMORY_DIR = os.path.join(BASE_DIR, "assistant_memory")
 os.makedirs(MEMORY_DIR, exist_ok=True)
 
+# ---- 多用户支持（v0.2）----
+# 每个线程可以指向不同的『用户数据目录』；终端版/窗口版不切换，
+# 用的就是默认 MEMORY_DIR，行为与之前完全一致。
+_USER_CTX = threading.local()
+
+def user_dir() -> str:
+    """当前线程的用户数据目录（默认全局 MEMORY_DIR）。"""
+    return getattr(_USER_CTX, "dir", None) or MEMORY_DIR
+
+def switch_user_dir(d: str) -> None:
+    """把当前线程切到指定用户的数据目录（不存在则创建）。"""
+    os.makedirs(d, exist_ok=True)
+    _USER_CTX.dir = d
+
+def fire_log() -> list:
+    """当前线程的『提醒已响』记录（多用户隔离；未初始化时给空列表）。"""
+    if not hasattr(_USER_CTX, "fire_log"):
+        _USER_CTX.fire_log = []
+    return _USER_CTX.fire_log
+
 # 这三份是"数据表"（待办/提醒/日程），外加助理自己的名字——不算用户记忆：回忆、长期记忆、整理员都不得读改它们
 NON_MEMORY_FNS = {"todo.md", "reminders.md", "schedule.md", "助理名字.md"}
 
@@ -78,7 +98,7 @@ def unpack_note(raw: str) -> tuple[str, str]:
 @tool
 def save_note(title: str, content: str) -> str:
     """记住一条关于用户的事实/喜好/待办，存成笔记文件（自动带记录时间）。用户明确说"记住/记一下/存个"时用。"""
-    path = os.path.join(MEMORY_DIR, f"{title}.md")
+    path = os.path.join(user_dir(), f"{title}.md")
     with open(path, "w", encoding="utf-8") as f:
         f.write(pack_note(content))
     return f"已记住: {title}"
@@ -87,10 +107,10 @@ def save_note(title: str, content: str) -> str:
 def recall_all() -> str:
     """回忆：列出当前记住的所有笔记（逐个读文件，含记录时间）。用户问"你记得我什么/我以前说过什么"时用。"""
     lines = []
-    for fn in sorted(os.listdir(MEMORY_DIR)):
+    for fn in sorted(os.listdir(user_dir())):
         if fn.endswith(".md") and fn not in NON_MEMORY_FNS:
             title = fn[:-3]
-            with open(os.path.join(MEMORY_DIR, fn), encoding="utf-8") as f:
+            with open(os.path.join(user_dir(), fn), encoding="utf-8") as f:
                 content, ts = unpack_note(f.read())
             note = f"- {title}：{content}"
             if ts:
@@ -101,7 +121,7 @@ def recall_all() -> str:
 @tool
 def forget(title: str) -> str:
     """遗忘：删除标题为 title 的笔记文件。用户说"忘掉X/删掉X"时用。"""
-    path = os.path.join(MEMORY_DIR, f"{title}.md")
+    path = os.path.join(user_dir(), f"{title}.md")
     if os.path.exists(path):
         os.remove(path)
         return f"已忘记: {title}"
@@ -111,7 +131,7 @@ def forget(title: str) -> str:
 def update_note(title: str, content: str) -> str:
     """更新：把标题为 title 的笔记内容改成 content（覆盖写，记录时间刷新为当下）。标题不存在时自动新建。
     用户说"改成/改为/换成/更新/改主意了/修正"时用。"""
-    path = os.path.join(MEMORY_DIR, f"{title}.md")
+    path = os.path.join(user_dir(), f"{title}.md")
     existed = os.path.exists(path)
     with open(path, "w", encoding="utf-8") as f:
         f.write(pack_note(content))
@@ -287,7 +307,7 @@ def search_web(query: str) -> str:
 
 def get_default_city() -> str:
     """读回『默认城市』这条记忆（标题为 默认城市 的笔记），没有就返回空串。"""
-    path = os.path.join(MEMORY_DIR, "默认城市.md")
+    path = os.path.join(user_dir(), "默认城市.md")
     if os.path.exists(path):
         content, _ = unpack_note(open(path, encoding="utf-8").read())
         return content.strip().strip("，,。：: ")
@@ -295,7 +315,7 @@ def get_default_city() -> str:
 
 def get_assistant_name() -> str:
     """读回助理自己的名字（用户起的），没有就返回空串。与用户名字分开存，绝不混。"""
-    path = os.path.join(MEMORY_DIR, "助理名字.md")
+    path = os.path.join(user_dir(), "助理名字.md")
     if os.path.exists(path):
         content, _ = unpack_note(open(path, encoding="utf-8").read())
         return content.strip().strip("，,。：: ")
@@ -317,13 +337,14 @@ def remember_assistant_name(raw: str) -> str:
 # 1.6) 待办清单：全部存在 todo.md 一个文件里（勾选列表，确定性函数执行）
 # ---------------------------------------------------------------
 TODO_FN = "todo.md"
-TODO_FILE = os.path.join(MEMORY_DIR, TODO_FN)
+def todo_file() -> str:
+    return os.path.join(user_dir(), TODO_FN)
 
 def load_todos() -> list[dict]:
     """读回 todo.md，变成 [{item, done, time}]。"""
     items = []
-    if os.path.exists(TODO_FILE):
-        for ln in open(TODO_FILE, encoding="utf-8").read().splitlines():
+    if os.path.exists(todo_file()):
+        for ln in open(todo_file(), encoding="utf-8").read().splitlines():
             ln = ln.strip()
             if not ln.startswith("- ["):
                 continue
@@ -336,7 +357,7 @@ def load_todos() -> list[dict]:
     return items
 
 def save_todos(items: list[dict]) -> None:
-    with open(TODO_FILE, "w", encoding="utf-8") as f:
+    with open(todo_file(), "w", encoding="utf-8") as f:
         for it in items:
             mark = "x" if it["done"] else " "
             ts = f"（记于 {it['time']}）" if it.get("time") else ""
@@ -397,15 +418,15 @@ def pick_todo_kw(raw: str) -> str:
 # 1.7) 定时提醒：存在 reminders.md，后台线程到点弹提醒（确定性解析时间）
 # ---------------------------------------------------------------
 REMIND_FN = "reminders.md"
-REMIND_FILE = os.path.join(MEMORY_DIR, REMIND_FN)
+def remind_file() -> str:
+    return os.path.join(user_dir(), REMIND_FN)
 _remind_lock = threading.Lock()
-FIRE_LOG: list[str] = []      # 后台线程到点提醒后的记录，聊天模型能看到（最近几条）
 
 def load_reminders() -> list[dict]:
     """读回 reminders.md → [{at: datetime, text}]。"""
     items = []
-    if os.path.exists(REMIND_FILE):
-        for ln in open(REMIND_FILE, encoding="utf-8").read().splitlines():
+    if os.path.exists(remind_file()):
+        for ln in open(remind_file(), encoding="utf-8").read().splitlines():
             ln = ln.strip()
             if ln.startswith("- ") and "：" in ln:
                 ts, text = ln[2:].split("：", 1)
@@ -417,7 +438,7 @@ def load_reminders() -> list[dict]:
     return items
 
 def save_reminders(items: list[dict]) -> None:
-    with open(REMIND_FILE, "w", encoding="utf-8") as f:
+    with open(remind_file(), "w", encoding="utf-8") as f:
         for it in sorted(items, key=lambda x: x["at"]):
             f.write(f"- {it['at'].strftime('%Y-%m-%d %H:%M')}：{it['text']}\n")
 
@@ -550,8 +571,8 @@ def _reminder_watcher() -> None:
                 save_reminders([it for it in items if it["at"] > now])
         for it in due:
             with _remind_lock:
-                FIRE_LOG.append(f"已在 {it['at'].strftime('%H:%M')} 提醒过用户：{it['text']}")
-                del FIRE_LOG[:-5]      # 只留最近 5 条
+                fire_log().append(f"已在 {it['at'].strftime('%H:%M')} 提醒过用户：{it['text']}")
+                del fire_log()[:-5]      # 只留最近 5 条
             print(f"\n⏰ 提醒时间到：{it['text']}（{it['at'].strftime('%H:%M')}）")
         time.sleep(2)
 
@@ -560,13 +581,14 @@ def _reminder_watcher() -> None:
 # 1.8) 日程表：存在 schedule.md（到点不响铃，是"哪天几点做什么"的安排）
 # ---------------------------------------------------------------
 SCHEDULE_FN = "schedule.md"
-SCHEDULE_FILE = os.path.join(MEMORY_DIR, SCHEDULE_FN)
+def schedule_file() -> str:
+    return os.path.join(user_dir(), SCHEDULE_FN)
 
 def load_schedule() -> list[dict]:
     """读回 schedule.md → [{at: datetime, text}]。"""
     items = []
-    if os.path.exists(SCHEDULE_FILE):
-        for ln in open(SCHEDULE_FILE, encoding="utf-8").read().splitlines():
+    if os.path.exists(schedule_file()):
+        for ln in open(schedule_file(), encoding="utf-8").read().splitlines():
             ln = ln.strip()
             if ln.startswith("- ") and "：" in ln:
                 ts, text = ln[2:].split("：", 1)
@@ -578,7 +600,7 @@ def load_schedule() -> list[dict]:
     return items
 
 def save_schedule(items: list[dict]) -> None:
-    with open(SCHEDULE_FILE, "w", encoding="utf-8") as f:
+    with open(schedule_file(), "w", encoding="utf-8") as f:
         for it in sorted(items, key=lambda x: x["at"]):
             f.write(f"- {it['at'].strftime('%Y-%m-%d %H:%M')}：{it['text']}\n")
 
@@ -641,7 +663,7 @@ def make_startup_briefing() -> str:
     else:
         greet = "夜深了"
     name = "朋友"
-    name_path = os.path.join(MEMORY_DIR, "名字.md")
+    name_path = os.path.join(user_dir(), "名字.md")
     if os.path.exists(name_path):
         n, _ = unpack_note(open(name_path, encoding="utf-8").read())
         if n:
@@ -704,10 +726,10 @@ def make_startup_briefing() -> str:
 # ---------------------------------------------------------------
 def load_long_memory() -> str:
     lines = []
-    for fn in sorted(os.listdir(MEMORY_DIR)):
+    for fn in sorted(os.listdir(user_dir())):
         if fn.endswith(".md") and fn not in NON_MEMORY_FNS:
             title = fn[:-3]
-            with open(os.path.join(MEMORY_DIR, fn), encoding="utf-8") as f:
+            with open(os.path.join(user_dir(), fn), encoding="utf-8") as f:
                 content, _ = unpack_note(f.read())
             lines.append(f"- {title}: {content}")
     return "\n".join(lines) if lines else "（暂无记忆）"
@@ -954,7 +976,7 @@ def summarize_recent_chat(history: list) -> str:
         return ""
     title = f"对话纪要_{datetime.datetime.now().strftime('%Y-%m-%d')}"
     # 同一天的多次总结：新旧合并，不覆盖
-    path = os.path.join(MEMORY_DIR, f"{title}.md")
+    path = os.path.join(user_dir(), f"{title}.md")
     if os.path.exists(path):
         old, _ = unpack_note(open(path, encoding="utf-8").read())
         summary = f"{old}；{summary}"
@@ -1006,16 +1028,16 @@ def executor_node(state: AsstState) -> dict:
     elif any(w in user_raw for w in ("忘记", "忘掉", "删掉")):
         title = ""
         # 先按标题精确匹配
-        for fn in sorted(os.listdir(MEMORY_DIR)):
+        for fn in sorted(os.listdir(user_dir())):
             if fn.endswith(".md") and fn[:-3] in user_raw:
                 title = fn[:-3]
                 break
         # 再按内容模糊匹配：标题里没"猫"但内容里有 → 也删
         if not title:
-            for fn in sorted(os.listdir(MEMORY_DIR)):
+            for fn in sorted(os.listdir(user_dir())):
                 if not fn.endswith(".md"):
                     continue
-                with open(os.path.join(MEMORY_DIR, fn), encoding="utf-8") as f:
+                with open(os.path.join(user_dir(), fn), encoding="utf-8") as f:
                     content, _ = unpack_note(f.read())
                 if content and any(k in content for k in (user_raw, user_raw.replace("忘记", "").replace("忘掉", "").replace("删掉", "").replace("那条", "").replace("的", "").strip())):
                     title = fn[:-3]
@@ -1048,15 +1070,15 @@ def executor_node(state: AsstState) -> dict:
         new_content = m_new.group(1).strip().strip("，,。") if m_new else ""
         # 定位标题：1) 话里直接含已存标题词  2) 旧词在内容里模糊匹配
         title = ""
-        for fn in sorted(os.listdir(MEMORY_DIR)):
+        for fn in sorted(os.listdir(user_dir())):
             if fn.endswith(".md") and fn[:-3] in user_raw:
                 title = fn[:-3]
                 break
         if not title and old_kw:
-            for fn in sorted(os.listdir(MEMORY_DIR)):
+            for fn in sorted(os.listdir(user_dir())):
                 if not fn.endswith(".md"):
                     continue
-                with open(os.path.join(MEMORY_DIR, fn), encoding="utf-8") as f:
+                with open(os.path.join(user_dir(), fn), encoding="utf-8") as f:
                     c, _ = unpack_note(f.read())
                 if old_kw and old_kw in c:
                     title = fn[:-3]
@@ -1096,7 +1118,7 @@ def executor_node(state: AsstState) -> dict:
                 for title, content in facts:
                     if title in ("备注", "记录"):
                         # 泛化标题同名会互相覆盖，改为追加合并，防止不同轮的事实丢失
-                        path = os.path.join(MEMORY_DIR, f"{title}.md")
+                        path = os.path.join(user_dir(), f"{title}.md")
                         if os.path.exists(path):
                             old, _ = unpack_note(open(path, encoding="utf-8").read())
                             content = f"{old}；{content}"
@@ -1166,8 +1188,8 @@ def chat_node(state: AsstState) -> dict:
             break
     long_mem = load_long_memory()
     system_extra = ""
-    if FIRE_LOG:                        # 后台已经响过的提醒，要让聊天席知道，别再说"还在等"
-        system_extra = f"\n系统近况（已发生的事，别把它当未来计划）：{'；'.join(FIRE_LOG)}"
+    if fire_log():                        # 后台已经响过的提醒，要让聊天席知道，别再说"还在等"
+        system_extra = f"\n系统近况（已发生的事，别把它当未来计划）：{'；'.join(fire_log())}"
     asst_name = get_assistant_name()
     name_hint = f"\n你（助理）的名字叫『{asst_name}』，用户问起你的名字要回答这个。" if asst_name else ""
     msgs: list = [
@@ -1259,9 +1281,9 @@ def extractor_node(state: AsstState) -> dict:
 def list_notes() -> list[dict]:
     """把所有记忆笔记读出来（标题/纯净内容/记录时间），整理员和主循环都用。"""
     items = []
-    for fn in sorted(os.listdir(MEMORY_DIR)):
+    for fn in sorted(os.listdir(user_dir())):
         if fn.endswith(".md") and fn not in NON_MEMORY_FNS:
-            with open(os.path.join(MEMORY_DIR, fn), encoding="utf-8") as f:
+            with open(os.path.join(user_dir(), fn), encoding="utf-8") as f:
                 content, ts = unpack_note(f.read())
             items.append({"title": fn[:-3], "content": content, "time": ts})
     return items
@@ -1288,7 +1310,7 @@ def run_tidy() -> str:
             if len(parts) == 3:
                 olds = [p.strip() for p in parts[0].split("+")]
                 new_title, new_content = parts[1].strip(), parts[2].strip()
-                exist = [t for t in olds if os.path.exists(os.path.join(MEMORY_DIR, f"{t}.md"))]
+                exist = [t for t in olds if os.path.exists(os.path.join(user_dir(), f"{t}.md"))]
                 if exist and new_title:
                     for t in olds:
                         forget.invoke({"title": t})

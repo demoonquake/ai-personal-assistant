@@ -401,11 +401,14 @@ def get_assistant_name() -> str:
 def remember_assistant_name(raw: str) -> str:
     """用户给『助理自己』起名时，存进 助理名字.md（不是用户名字槽）。
     命中返回结果文本，没命中返回空串。"""
+    # 问句拦截：『你叫什么名字』『名字叫啥』这类是提问，不是给助理起名
+    #（executor 路径有问句拦截，但聊天路径 run_side_effects 会直连本函数，所以这里必须自己拦）
+    if re.search(r"(?:叫|是)(?:什|啥)么?名字|名字(?:是|叫)(?:什|啥)么|你叫(?:什|啥)", raw):
+        return ""
     m = re.search(r"(?:你的名字(?:是|叫|叫做|就叫)|以后(?:就叫你|叫你)|你就叫|你叫)([\u4e00-\u9fa5A-Za-z0-9]{1,10})", raw)
     if not m:
         return ""
     name = m.group(1).strip().strip("，,。！! ")
-    # 误伤防护：像"你叫什么名字"这种问句跑不到这（前面有问句拦截）；这里只认祈使/陈述
     save_note.invoke({"title": "助理名字", "content": name})
     return f"已把『助理自己的名字』设为「{name}」（用户的名字保持原样未动）"
 
@@ -1274,8 +1277,8 @@ def digest_title(raw: str) -> str:
 def split_facts(raw: str) -> list[tuple[str, str]]:
     """把用户的一句话拆成 {槽位标题: 内容} 的多条记忆（规则法，不靠模型）。
 
-    例：“记住，我是张俊浩，喜欢睡觉和打游戏，目前大三”
-      → [("名字", "张俊浩"), ("爱好", "睡觉和打游戏"), ("年级", "大三")]
+    例：“记住，我是小明，喜欢睡觉和打游戏，目前大三”
+      → [("名字", "小明"), ("爱好", "睡觉和打游戏"), ("年级", "大三")]
     """
     import re
     text = raw.replace("记住", "").strip()

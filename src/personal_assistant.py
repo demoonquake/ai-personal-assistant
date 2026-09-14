@@ -535,6 +535,45 @@ def pick_todo_kw(raw: str) -> str:
     return kw.strip().strip("，,。?! ")
 
 
+# ---------------- 待办操作确认上下文 ----------------
+# 命令路径（executor）是规则法且跨轮无状态，用线程级小状态承接
+# 『删除待办 → 你确认删哪件 → 是的，删除这条』这类两轮对话，
+# 避免确认句掉进『记住』分支被当成记忆存成"备注"垃圾笔记。
+_TODO_PENDING = threading.local()
+_TODO_PENDING_TTL = 90                       # 确认窗口：90 秒内不回应则作废
+_TODO_CONFIRM_WORDS = ("是的", "对的", "确认", "确定", "可以的", "就删", "删这条",
+                       "没错", "好呀", "要删", "好的", "可以", "嗯")
+
+def set_todo_pending(action: str) -> None:
+    _TODO_PENDING.action = action
+    _TODO_PENDING.ts = time.time()
+
+def todo_pending() -> str:
+    """还有效的待确认待办操作（'删除'/'完成'），没有则返回 ''。"""
+    ts = getattr(_TODO_PENDING, "ts", 0.0)
+    if ts and time.time() - ts <= _TODO_PENDING_TTL:
+        return getattr(_TODO_PENDING, "action", "")
+    return ""
+
+def clear_todo_pending() -> None:
+    try:
+        del _TODO_PENDING.ts
+    except Exception:
+        pass
+
+def apply_todo_pending(action: str) -> str:
+    """执行待办确认操作：未完成只有 1 件 → 直接删/完成；0 件 → 提示；多件 → 再问具体哪件。"""
+    items = [it for it in load_todos() if not it["done"]]
+    if not items:
+        return "（没有未完成的待办可处理～）"
+    if len(items) > 1:
+        return f"（有 {len(items)} 件未完成待办，具体处理哪件？直接告诉我要删/完成的是哪件事）"
+    it = items[0]
+    if action == "删除":
+        return remove_todo(it["item"])
+    return done_todo(it["item"])
+
+
 # ---------------------------------------------------------------
 # 1.7) 定时提醒：存在 reminders.md，后台线程到点弹提醒（确定性解析时间）
 # ---------------------------------------------------------------
@@ -1367,7 +1406,14 @@ def executor_node(state: AsstState) -> dict:
 
     # 意图判定（关键词，简单可靠）——待办/提醒优先，因为"提醒/记得"会和记忆命令抢
     todo_words = ("待办", "提醒", "别忘了")
-    if any(w in user_raw for w in todo_words):
+    # 待办确认承接：上一轮刚问过『删/完成哪件？』，这句是确认/回答 → 直接执行登记的操作
+    # （规则法跨轮无状态，靠 _TODO_PENDING 小状态衔接，防止确认句被当成『记住』存成垃圾笔记）
+    pending = todo_pending()
+    if pending and not user_raw.startswith(("记住", "帮我记住", "记一下", "记着", "记为")) \
+            and any(w in user_raw for w in _TODO_CONFIRM_WORDS):
+        note = apply_todo_pending(pending)
+        clear_todo_pending()
+    elif any(w in user_raw for w in todo_words):
         is_remind = ("提醒" in user_raw) or ("别忘了" in user_raw)
         at, content = parse_remind_time(user_raw) if is_remind else (None, "")
         if is_remind and at and content:
@@ -1380,21 +1426,31 @@ def executor_node(state: AsstState) -> dict:
         elif is_remind and any(w in user_raw for w in ("删", "取消", "移除")):
             kw = pick_todo_kw(user_raw)
             note = f"取消提醒结果：{cancel_reminder(kw)}" if kw else "（要取消哪条提醒？）"
-        elif any(w in user_raw for w in ("加", "添加", "新增", "记个", "记一个", "写", "设", "提醒", "别忘了")):
-            m_item = re.search(r"(?:提醒我?|记个?待办|加个?待办|添加个?待办|新增待办|设个?提醒|别忘了|写上)[，,：: ]*(.+)", user_raw)
+        elif any(w in user_raw for w in ("加", "添加", "新增", "记个", "记一个", "写上", "写下", "写个", "设", "提醒", "别忘了")):
+            m_item = re.search(r"(?:提醒我?|记个?待办|加个?待办|添加个?待办|新增待办|设个?提醒|别忘了|写上|写下)[，,：: ]*(.+)", user_raw)
             item = m_item.group(1).strip().strip("，,。！!") if m_item else ""
             if not item:   # 兜底：把命令词剥掉剩下的当内容
                 item = user_raw
-                for w in ("添加", "新增", "加个待办", "记个待办", "待办", "提醒我", "提醒", "别忘了", "设置", "写"):
+                for w in ("添加", "新增", "加个待办", "记个待办", "待办", "提醒我", "提醒", "别忘了", "设置", "写上", "写下"):
                     item = item.replace(w, "")
                 item = item.strip().strip("，,：:。！!")
             note = f"待办添加结果：{add_todo_item.func(item)}" if item else "（想提醒我做什么呢？）"
         elif any(w in user_raw for w in ("完成", "搞定", "做完", "做掉")):
             kw = pick_todo_kw(user_raw)
-            note = f"待办完成结果：{done_todo(kw)}" if kw else "（哪件待办完成啦？）"
+            if kw:
+                note = f"待办完成结果：{done_todo(kw)}"
+            else:
+                # 没点名哪件 → 登记待确认 + 列出清单，等用户下句确认
+                set_todo_pending("完成")
+                note = f"待办清单如下：\n{list_todos()}\n（哪件完成啦？直接告诉我要完成的是哪件事）"
         elif any(w in user_raw for w in ("删", "取消", "移除", "忘掉")):
             kw = pick_todo_kw(user_raw)
-            note = f"待办删除结果：{remove_todo(kw)}" if kw else "（要删哪件待办？）"
+            if kw:
+                note = f"待办删除结果：{remove_todo(kw)}"
+            else:
+                # 没点名哪件 → 登记待确认 + 列出清单，等用户下句确认
+                set_todo_pending("删除")
+                note = f"待办清单如下：\n{list_todos()}\n（想删掉哪件？直接告诉我要删的是哪件事）"
         else:
             note = f"待办清单如下：\n{list_todos()}"
     elif any(w in user_raw for w in ("忘记", "忘掉", "删掉")):
@@ -1474,8 +1530,17 @@ def executor_node(state: AsstState) -> dict:
         out = recall_all.invoke({})
         note = f"记忆内容如下：\n{out}"
     else:
+        # 兜底防护⓪：确认/应答短句（常是承接上一轮的询问）不是要记住的内容 → 不落盘
+        # （有登记的待办确认就执行；没有就礼貌回应，绝不让确认句被 split_facts 拆成"备注"垃圾笔记）
+        if not user_raw.startswith(("记住", "帮我记住", "记一下", "记着", "记为")) \
+                and any(w in user_raw for w in _TODO_CONFIRM_WORDS):
+            if todo_pending():
+                note = apply_todo_pending(todo_pending())
+                clear_todo_pending()
+            else:
+                note = "（收到～ 想删/完成待办、设提醒或让我记住什么，直接告诉我就行）"
         # 兜底防护①：带问号/疑问词的句子大概率是提问，不是要记住的内容（模型偶尔会误判）
-        if not user_raw.startswith(("记住", "帮我记住", "记一下", "记着", "记为")) and any(
+        elif not user_raw.startswith(("记住", "帮我记住", "记一下", "记着", "记为")) and any(
                 q in user_raw for q in ("？", "?", "吗", "什么", "啥", "呢", "怎么", "等于", "多少", "天气", "气温", "几度", "几点", "几号")):
             note = "（这句像是问句，我先不存。想让我记住什么，直接告诉我就行～）"
         elif (naming := remember_assistant_name(user_raw)):
@@ -1591,6 +1656,8 @@ def _chat_system_prompt(long_mem: str, system_extra: str = "", name_hint: str = 
         "设提醒(set_reminder)、记日程(add_schedule)、查日程(list_schedule_tool)。"
         "遇到实时新闻/概念/百科类问题用 search_web 搜一下再回答；用户要你设置提醒/加待办/记日程时用对应工具真实执行。\n"
         "用户说『每日晨报』『今日晨报』『看晨报』『汇报今天的安排』时就调 morning_report 生成；"
+        "注意：用户只是问/看待办、日程、提醒时，只用只读工具（看待办/查日程），"
+        "绝不要在查询时顺手调用完成/删除/添加这类写工具；只有用户这句话明确说了删/完成/加才用写工具。\n"
         "多工具任务示例：用户说『明天下雨就提醒我带伞』→ 第一步调 get_weather 查明天降水概率 → "
         "第二步根据结果决定：会下雨才调 set_reminder（text 只写『带伞』，when 用用户给的时间，没给就用明天8点这种合理时间）；"
         "不下雨就直接告诉用户明天不用带伞。用户一次说多件事的待办，要拆开、对每件事分别调一次 add_todo_item。\n"
@@ -1709,7 +1776,12 @@ def stream_reply(user_raw: str, history: list):
         verdict = (getattr(last, "content", None) or "").strip()
     except Exception:
         verdict = ""
-    if not verdict.startswith("聊天"):
+    # 纯查询类（看待办/提醒/日程）强制走规则只读路径：
+    # 避免前台误判成"聊天"后模型在查看时顺手调用删除/完成等写工具
+    _QUERY_HINTS = ("有哪些待办", "看看待办", "我的待办", "待办清单", "待办在哪", "有什么待办", "待办有",
+                    "有哪些提醒", "看看提醒", "我的提醒", "提醒清单", "查查提醒", "最近提醒", "提醒有",
+                    "有哪些日程", "看看日程", "我的日程", "日程清单", "查查日程", "最近日程", "日程有")
+    if not verdict.startswith("聊天") or any(q in user_raw for q in _QUERY_HINTS):
         # —— 记忆/待办/提醒/整理 等命令：规则法办事（短回复一次性给出）——
         try:
             st = {"messages": [HumanMessage(content=user_raw)],
@@ -1933,8 +2005,10 @@ def _get_reflect_agent():
 def reflect_memory(user_raw: str, history: list) -> str:
     """记忆反思：拿『最新对话』对账『相关旧记忆』，发现过时/冲突就自动更新或删除。"""
     # 数据表操作命令（待办/提醒/日程/晨报）只改 todo.md、reminders.md 等，
-    # 与用户记忆无关；若不拦住，『删掉XX待办』会被反思误当『删除→XX』指令，威胁真实记忆
-    if any(w in user_raw for w in ("待办", "提醒", "别忘了", "日程", "晨报")):
+    # 与用户记忆无关；若不拦住，『删掉XX待办』会被反思误当『删除→XX』指令，威胁真实记忆。
+    # 确认/应答短句（是/对/确定…）多是在回应这类操作，同样跳过。
+    if any(w in user_raw for w in ("待办", "提醒", "别忘了", "日程", "晨报")) \
+            or any(w in user_raw for w in _TODO_CONFIRM_WORDS):
         return ""
     ctx_parts = [user_raw]
     for m in list(history or [])[-4:]:

@@ -472,61 +472,104 @@ def _voice_worker(ev: threading.Event) -> None:
         _q.put(("vidle", "", ""))
 
 
-# ---------------- 分句即时朗读 ----------------
-# 回答边打字边说：主线程按句子把文本送进朗读队列，后台 worker 用当前音色/语速顺序朗读
-# （voice_on 开着才提交；新问题/关朗读时清空队列并立即停声）
-_spk_q: queue.Queue = queue.Queue()
+# ---------------- 分句即时朗读（合成/播放两段流水线） ----------------
+# 回答边打字边说：主线程按句子切分 → 送进"待合成"队列；
+# 合成线程（联网 edge-tts）串行合成 → 放进"待播放"队列；
+# 播放线程顺序出声。这样在播上一句的同时下一句已在合成，句间断续最小化。
+# （朗读开着才提交；新问题/关朗读时清空两个队列并立即停声）
+_spk_q: queue.Queue = queue.Queue()       # 待合成：文本句子
+_out_q: queue.Queue = queue.Queue()       # 待播放：已合成 mp3 路径
 _speak_buf = ""                        # 主线程累积待切句的流式文本
-_SENT_END = re.compile(r"[。！？!?…\n；;]")
+# 硬断点：真正的句末（读起来自然停顿）；软断点：逗号类（只在段落已较长时才在软断点处断）
+_HARD_END = re.compile(r"[。！？!?…⋯︙～~；;\n]|\.{3,}")   # 含省略号（…⋯︙…与 ...）和飘号（～~）
+_SOFT_END = re.compile(r"[，、,]")
+_CHUNK = 30                            # 没到句末但攒够 30 字 → 找最近断点切段（语音尽早起步）
+_MIN_CUT = 8                           # 段落最小长度：太碎的"好的，"不单独读，攒进下一段
 
-def _take_sentence(buf: str):
-    """从累积文本里取第一个完整句子（含结尾标点）；没有则 (空, 原文)。"""
-    m = _SENT_END.search(buf)
-    if m:
-        idx = m.end()
-        return buf[:idx].strip(), buf[idx:]
-    return "", buf
-
-def _clear_speech_queue() -> None:
-    """丢弃还没读的句子（换新问题/关朗读时用）。"""
+def _drain(q: queue.Queue) -> None:
     while True:
         try:
-            _spk_q.get_nowait()
+            q.get_nowait()
         except queue.Empty:
             break
 
-def _speaker_worker() -> None:
-    """后台顺序朗读：一句接一句，读到一半被 stop 也不崩。"""
+def _clear_speech_queue() -> None:
+    """丢弃还没合成/没播放的内容（换新问题/关朗读时用）。"""
+    _drain(_spk_q)
+    _drain(_out_q)
+
+def _tts_worker() -> None:
+    """合成线程：句子 → mp3（串行，保证顺序）；失败上报一次。"""
     while True:
         seg = _spk_q.get()
         try:
-            if seg and _voice_enabled:
-                r = sp.speak(seg, _voice_set["voice"], _voice_set["rate"])
-                if r:                                 # 朗读失败提示只发一次
-                    _q.put(("vlog", "", r))
+            if not seg or not _voice_enabled:
+                continue
+            mp3 = sp.synthesize(seg, _voice_set["voice"], _voice_set["rate"])
+            if mp3.startswith("🌐"):                    # 合成失败（需联网等）→ 提示一次
+                _q.put(("vlog", "", mp3))
+            elif mp3 and _voice_enabled:
+                _out_q.put(mp3)                         # 已合成，交给播放线程
+        except Exception:
+            pass
+
+def _play_worker() -> None:
+    """播放线程：按顺序出声；朗读被关掉则丢弃并清理文件。"""
+    while True:
+        mp3 = _out_q.get()
+        try:
+            if not mp3:
+                continue
+            if _voice_enabled:
+                sp.play_file(mp3)                   # 顺序播放（阻塞到播完）
+            else:
+                try:
+                    os.remove(mp3)
+                except Exception:
+                    pass
         except Exception:
             pass
 
 def _feed_speech(payload: str) -> None:
-    """收到流式文字 → 按句把完整句交给朗读队列（主线程调用）。"""
+    """收到流式文字 → 切段送读，保证语音尽早起步又不断句怪异：
+    句末（硬断点）处正常切；无句末时攒满 30 字仍在最近的逗号类断点/整段切；
+    太碎的短段不单独读，攒进下一段。"""
     global _speak_buf
     if not _voice_enabled:
         return
     _speak_buf += payload
     while True:
-        seg, _speak_buf = _take_sentence(_speak_buf)
-        if not seg:
-            break
-        _spk_q.put(seg)
+        m = _HARD_END.search(_speak_buf)            # 1) 真正的句末 → 直接切
+        if m:
+            end = m.end()
+            seg, _speak_buf = _speak_buf[:end].strip(), _speak_buf[end:]
+            if seg:
+                _spk_q.put(seg)
+            continue
+        if len(_speak_buf) >= _CHUNK:               # 2) 没句末但攒够了 → 找最近软断点
+            pos, last = 0, -1
+            for mm in _SOFT_END.finditer(_speak_buf):
+                last = mm.end()
+            if last >= _MIN_CUT:                    # 断点位置够长 → 在逗号处断
+                pos = last
+                seg, _speak_buf = _speak_buf[:pos].strip(), _speak_buf[pos:]
+                if seg:
+                    _spk_q.put(seg)
+                continue
+            _spk_q.put(_speak_buf)                  # 无合适的逗号断点 → 整段切
+            _speak_buf = ""
+            continue
+        break
 
 def _flush_speech() -> None:
-    """回答结束：把没到句尾的尾巴也交出去读。"""
+    """回答结束：把没到句尾的尾巴也交给合成队列。"""
     global _speak_buf
     if _voice_enabled and _speak_buf.strip():
         _spk_q.put(_speak_buf.strip())
     _speak_buf = ""
 
-threading.Thread(target=_speaker_worker, daemon=True).start()
+threading.Thread(target=_tts_worker, daemon=True).start()
+threading.Thread(target=_play_worker, daemon=True).start()
 
 
 def poll() -> None:

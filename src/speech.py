@@ -12,6 +12,7 @@
 """
 
 import os
+import re
 import sys
 import wave
 import ctypes
@@ -220,24 +221,48 @@ def _play_mci(mp3: str) -> None:
 
 
 def speak(text: str, voice: str = "", rate: str = "") -> str:
-    """把文字朗读出来（voice/rate 为 edge-tts 音色/语速，空则用默认）。
-    成功返回 ""；失败返回给用户看的中文提示（界面显示一次即可）。"""
+    """把文字朗读出来（voice/rate 为 edge-tts 音色/语速，空则用默认）：
+    合成 + 顺序播放一次完成。成功返回 ""；失败返回给用户看的中文提示。"""
+    r = synthesize(text, voice, rate)
+    if r:
+        return r
+    return ""
+
+
+def synthesize(text: str, voice: str = "", rate: str = "") -> str:
+    """把一句话合成为 mp3（edge-tts，联网）；前方为语音常驻 mp3 路径。
+    返回 "" 成功；失败返回中文提示。语音开流水线时用合成/播放分离的两个原语。"""
+    import tempfile as _tf
+    text = _strip_emoji(text)
     text = (text or "").strip()
     if not text:
         return ""
-    mp3 = tempfile.mktemp(prefix="pa_tts_", suffix=".mp3")
+    mp3 = _tf.mktemp(prefix="pa_tts_", suffix=".mp3")
     try:
         asyncio.run(_tts_save(text, mp3, voice, rate))
-        if os.path.getsize(mp3) < 1024:     # edge-tts 空响应/失败保护
+        if not os.path.exists(mp3) or os.path.getsize(mp3) < 1024:
             raise OSError("empty audio")
-        _play_mci(mp3)                      # mp3 生命周期从此归 _play_mci 管
-        return ""
+        return mp3                                   # 成功：返回 mp3 路径（播放完由播放端删除）
     except Exception:
         try:
             os.remove(mp3)
         except Exception:
             pass
         return "🌐 朗读需要联网（或代理没通），这次没读出声音。"
+
+
+def play_file(mp3: str) -> None:
+    """顺序播放一段已合成的 mp3（会阻塞到播完），播完自动删除文件。"""
+    if mp3:
+        _play_mci(mp3)
+
+
+# 朗读前剥掉 emoji 等装饰字符，避免 TTS 把😊读成"微笑"之类的尴尬
+_EMOJI_FILTER = re.compile(
+    r"[\U0001F000-\U0001FAFF\u2600-\u27BF\u2B00-\u2BFF\uFE0F\u200D\u20E3\uFE0E]")
+
+def _strip_emoji(text: str) -> str:
+    return _EMOJI_FILTER.sub("", text or "")
 
 
 def stop_speak() -> None:

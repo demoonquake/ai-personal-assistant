@@ -9,6 +9,9 @@ runtime/assistant_memory/
 # 浏览器版多用户数据（用户目录、users.json 全是隐私）
 runtime/data/
 
+# 桌面版本地偏好（窗口大小记忆等，纯个人设置）
+runtime/gui_config.json
+
 # 密钥（绝不能上传）
 deepseek_key.txt
 *.env

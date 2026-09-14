@@ -1,0 +1,8 @@
+# 可选增强：语音交互（桌面版）
+# 装好后首次点 🎤 会自动下载 ~150MB whisper 中文小模型到 项目根/cache/models/whisper（一次性，之后离线可用）
+# 不装也能用文字聊天——程序自动把语音按钮置灰
+# 国内网络下载模型前先执行：$env:HF_ENDPOINT = "https://hf-mirror.com"
+# 朗读（🔊）依赖联网访问微软 Edge TTS 服务；若本机开了系统代理会自动带上
+faster-whisper
+sounddevice
+edge-tts

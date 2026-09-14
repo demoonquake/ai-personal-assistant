@@ -1,0 +1,198 @@
+"""
+语音交互模块（桌面图形界面用 · 可选依赖）
+=========================================
+提供三段能力（全部在函数内延迟 import，不装语音依赖也能 import 本模块）：
+  · record_audio(stop_event)    —— 麦克风录音（sounddevice），阻塞直到 stop_event 触发
+  · transcribe(wav_path)        —— 本地中文识别（faster-whisper，完全离线）
+  · speak(text)                 —— 朗读（edge-tts 生成 + Windows winmm 播放，需要联网）
+  · speech_available()          —— 探测依赖是否齐全（给 UI 决定按钮灰不灰）
+
+模型约定：首次点话筒自动从 HuggingFace 下载 ~150MB 中文小模型到『项目根/cache/models/whisper』，
+之后完全离线。国内网络先执行：$env:HF_ENDPOINT = "https://hf-mirror.com"
+"""
+
+import os
+import sys
+import wave
+import ctypes
+import asyncio
+import tempfile
+import threading
+
+# 项目根：源码在 src/ 下，语音模型与向量模型同一约定放 cache/models/
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+WHISPER_DIR = os.path.join(BASE_DIR, "cache", "models", "whisper")
+
+_WHISPER_MODEL = None
+_WHISPER_LOCK = threading.Lock()
+_MCI_LOCK = threading.Lock()          # winmm 播放是"一个设备"，串行访问防乱
+_LAST_MP3 = ""                        # 正在播放的 mp3 路径（替换时才删除）
+_HAS_PROXY = None                     # 系统代理是否已探测（缓存，避免每句都查注册表）
+
+
+def speech_available() -> tuple:
+    """返回 (是否可用, 说明)。只做 import 探测，不做下载。"""
+    missing = []
+    for name in ("sounddevice", "faster_whisper", "edge_tts", "numpy"):
+        try:
+            __import__(name)
+        except ImportError:
+            missing.append(name)
+    if missing:
+        return False, ("缺少语音依赖：{}（pip install -r requirements-voice.txt）"
+                       .format("、".join(sorted(missing))))
+    return True, "可用"
+
+
+# ---------------- 录音 ----------------
+
+def record_audio(stop_event: threading.Event) -> str:
+    """录音直到 stop_event 被 set。返回临时 wav 路径（16k mono int16）；没录到声音返回 ""。"""
+    import sounddevice as sd
+    import numpy as np
+
+    frames = []
+    # 按设备默认采样率录（PortAudio 会做设备级重采样），再用 numpy 线性重采样到 16k
+    info = sd.query_devices(kind="input")
+    sr = int(info.get("default_samplerate", 16000) or 16000)
+
+    def _cb(indata, _frames, _time, _status):
+        if not stop_event.is_set():
+            frames.append(indata.copy())
+
+    with sd.InputStream(samplerate=sr, channels=1, dtype="int16", callback=_cb):
+        stop_event.wait()                     # 阻塞直到用户点停
+    if not frames:
+        return ""
+    audio = np.concatenate(frames).reshape(-1)          # int16
+    if sr != 16000:                                      # 线性重采样到 whisper 友好采样率
+        idx = np.linspace(0, audio.size - 1,
+                          int(audio.size * 16000 // sr)).astype(int)
+        audio = audio[idx]
+    wav = tempfile.mktemp(prefix="pa_voice_", suffix=".wav")
+    with wave.open(wav, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(16000)
+        wf.writeframes(audio.tobytes())
+    return wav
+
+
+# ---------------- 识别（本地 whisper） ----------------
+
+def _get_whisper():
+    """faster-whisper 模型进程内单例（锁保证只加载一次）。"""
+    global _WHISPER_MODEL
+    if _WHISPER_MODEL is not None:
+        return _WHISPER_MODEL
+    with _WHISPER_LOCK:
+        if _WHISPER_MODEL is None:
+            import faster_whisper
+            os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
+            os.makedirs(WHISPER_DIR, exist_ok=True)
+            # 模型 ID 写全名，避免只写 "small" 时的下载歧义
+            _WHISPER_MODEL = faster_whisper.WhisperModel(
+                "Systran/faster-whisper-small", device="cpu",
+                compute_type="int8", download_root=WHISPER_DIR)
+    return _WHISPER_MODEL
+
+
+def transcribe(wav_path: str) -> str:
+    """本地识别中文语音 → 文字（空串 = 没听清）。"""
+    if not wav_path or not os.path.exists(wav_path):
+        return ""
+    model = _get_whisper()
+    segments, _info = model.transcribe(wav_path, language="zh",
+                                       beam_size=5, vad_filter=True)
+    return "".join(seg.text for seg in segments).strip()
+
+
+# ---------------- 朗读（edge-tts + Windows 自带播放器） ----------------
+
+def _system_proxy():
+    """读 Windows 注册表里的系统代理（有则返回 'http://host:port'，无则 ''）。"""
+    global _HAS_PROXY
+    if _HAS_PROXY is not None:
+        return _HAS_PROXY
+    _HAS_PROXY = ""
+    try:
+        import winreg
+        key = r"Software\Microsoft\Windows\CurrentVersion\Internet Settings"
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, key) as k:
+            enable = winreg.QueryValueEx(k, "ProxyEnable")[0]
+            proxy = winreg.QueryValueEx(k, "ProxyServer")[0]
+        if enable and proxy:
+            _HAS_PROXY = proxy if "://" in proxy else "http://" + proxy
+    except Exception:
+        pass
+    return _HAS_PROXY
+
+
+async def _tts_save(text: str, mp3: str) -> None:
+    import edge_tts
+    proxy = _system_proxy()
+    try:
+        com = edge_tts.Communicate(text, "zh-CN-XiaoxiaoNeural", proxy=proxy or None)
+    except TypeError:                       # 老版本 edge-tts 没有 proxy 参数
+        com = edge_tts.Communicate(text, "zh-CN-XiaoxiaoNeural")
+    await com.save(mp3)
+
+
+def _play_mci(mp3: str) -> None:
+    """winmm 播放 mp3（Windows 自带，零额外依赖）。播放新音频前先关掉旧设备，防声音重叠。
+    mp3 文件生命周期移交本函数：被下一个音频替换（close 后）才删除，避免删到正在播的文件。"""
+    global _LAST_MP3
+    winmm = ctypes.windll.winmm
+    alias = "voice_out"
+    with _MCI_LOCK:
+        winmm.mciSendStringW("close " + alias, None, 0, 0)      # 停掉上一段
+        if _LAST_MP3 and os.path.exists(_LAST_MP3):             # 上一段已释放，删旧文件
+            try:
+                os.remove(_LAST_MP3)
+            except Exception:
+                pass
+            _LAST_MP3 = ""
+        if winmm.mciSendStringW(f'open "{mp3}" alias {alias}', None, 0, 0) != 0:
+            try:
+                os.remove(mp3)                                    # 没打开成功，直接清掉
+            except Exception:
+                pass
+            return
+        _LAST_MP3 = mp3
+        winmm.mciSendStringW(f"play {alias}", None, 0, 0)        # 不 wait，后台接着播
+
+
+def speak(text: str) -> str:
+    """把文字朗读出来。成功返回 ""；失败返回给用户看的中文提示（界面显示一次即可）。"""
+    text = (text or "").strip()
+    if not text:
+        return ""
+    mp3 = tempfile.mktemp(prefix="pa_tts_", suffix=".mp3")
+    try:
+        asyncio.run(_tts_save(text, mp3))
+        if os.path.getsize(mp3) < 1024:     # edge-tts 空响应/失败保护
+            raise OSError("empty audio")
+        _play_mci(mp3)                      # mp3 生命周期从此归 _play_mci 管
+        return ""
+    except Exception:
+        try:
+            os.remove(mp3)
+        except Exception:
+            pass
+        return "🌐 朗读需要联网（或代理没通），这次没读出声音。"
+
+
+def stop_speak() -> None:
+    """停止当前朗读（录音开始时调用，防止把回声录进去）。"""
+    global _LAST_MP3
+    try:
+        with _MCI_LOCK:
+            ctypes.windll.winmm.mciSendStringW("close voice_out", None, 0, 0)
+            if _LAST_MP3 and os.path.exists(_LAST_MP3):
+                try:
+                    os.remove(_LAST_MP3)
+                except Exception:
+                    pass
+                _LAST_MP3 = ""
+    except Exception:
+        pass
